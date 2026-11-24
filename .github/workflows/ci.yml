@@ -34,3 +34,6 @@ jobs:
       - name: PresentMon benchmark statistics tests
         shell: pwsh
         run: ./tools/benchmark/test-present-metrics.ps1
+      - name: Present regression gate tests
+        shell: pwsh
+        run: ./tools/benchmark/test-regression-metrics.ps1

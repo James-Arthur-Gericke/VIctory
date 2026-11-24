@@ -38,6 +38,8 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
+    #[cfg(feature = "diagnostics")]
+    budget_adapter: Option<IDXGIAdapter3>,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -184,6 +186,8 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        #[cfg(feature = "diagnostics")]
+        let budget_adapter = budget_adapter(&device);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -211,6 +215,8 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             queue,
+            #[cfg(feature = "diagnostics")]
+            budget_adapter,
             fence,
             submitted: Mutex::new(0),
             event,
@@ -223,6 +229,59 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// Resolve the adapter by the device's LUID, not by enumeration order.
+#[cfg(feature = "diagnostics")]
+fn budget_adapter(device: &ID3D12Device) -> Option<IDXGIAdapter3> {
+    std::env::var_os("VICTORY_GPU_RESIDENCY")?;
+    // SAFETY: plain queries on a live device and factory.
+    let result = unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
+    };
+    match result {
+        Ok(adapter) => Some(adapter),
+        Err(e) => {
+            tracing::warn!(error = %e, "GPU memory budget monitoring unavailable");
+            None
+        }
+    }
+}
+
+/// Headroom is not physical free VRAM; the OS can change the budget.
+#[cfg(any(test, feature = "diagnostics"))]
+fn budget_balance(usage: u64, budget: u64) -> (u64, u64) {
+    (budget.saturating_sub(usage), usage.saturating_sub(budget))
+}
+
+#[cfg(feature = "diagnostics")]
+fn log_memory_budget(adapter: &IDXGIAdapter3) {
+    for (segment, label) in [
+        (DXGI_MEMORY_SEGMENT_GROUP_LOCAL, "local"),
+        (DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, "non-local"),
+    ] {
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: live adapter and a writable output structure; node zero
+        // is the primary physical node, not a sum across linked GPUs.
+        match unsafe { adapter.QueryVideoMemoryInfo(0, segment, &mut info) } {
+            Ok(()) => {
+                let (headroom, over_budget) = budget_balance(info.CurrentUsage, info.Budget);
+                tracing::info!(
+                    node = 0,
+                    segment = label,
+                    usage_bytes = info.CurrentUsage,
+                    budget_bytes = info.Budget,
+                    headroom_bytes = headroom,
+                    over_budget_bytes = over_budget,
+                    reservation_bytes = info.CurrentReservation,
+                    available_reservation_bytes = info.AvailableForReservation,
+                    "GPU memory budget sample"
+                );
+            }
+            Err(e) => tracing::debug!(node = 0, segment = label, error = %e, "GPU memory budget query failed"),
+        }
     }
 }
 
@@ -251,6 +310,16 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_budget_balance_handles_over_budget_and_zero() {
+        assert_eq!(budget_balance(3, 8), (5, 0));
+        assert_eq!(budget_balance(8, 8), (0, 0));
+        assert_eq!(budget_balance(10, 8), (0, 2));
+        assert_eq!(budget_balance(0, 0), (0, 0));
+        assert_eq!(budget_balance(u64::MAX, 0), (0, u64::MAX));
+        assert_eq!(budget_balance(0, u64::MAX), (u64::MAX, 0));
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -1538,6 +1607,9 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                if let Some(adapter) = host().and_then(|h| h.budget_adapter.as_ref()) {
+                    log_memory_budget(adapter);
+                }
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

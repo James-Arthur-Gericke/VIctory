@@ -32,4 +32,15 @@ fi
 # Same-file comparisons must not conflate counts.
 sh "$here/compare-logs.sh" "$tmp/base" "$tmp/base" 1 1 2 2 > "$tmp/out"
 grep -Eq '^ms/frame +1000.000 +800.000 +-200.000' "$tmp/out"
-echo '8 checks passed'
+# Unequal frame counts: a fast window contributes more frames, not equal weight.
+{ sample 1000 20 | sed 's/$/ sample_frames=1/'; sample 100 2 | sed 's/^/sample_frames=9 /'; } > "$tmp/wbase"
+{ sample 500 4 | sed 's/$/ sample_frames=2/'; sample 250 2 | sed 's/$/ sample_frames=4/'; } > "$tmp/wcand"
+sh "$here/compare-logs.sh" "$tmp/wbase" "$tmp/wcand" 1 2 1 2 > "$tmp/out"
+grep -Fq 'Frame-weighted estimates' "$tmp/out"
+grep -Eq '^ms/frame +190.000 +333.333 +\+143.333' "$tmp/out"
+grep -Eq '^fps +5.263 +3.000 +-2.263' "$tmp/out"
+grep -Eq '^dropped/frame +3.800 +2.667 +-1.133' "$tmp/out"
+sh "$here/compare-logs.sh" "$tmp/wbase" "$tmp/cand" 1 2 1 2 > "$tmp/out"
+grep -Fq 'frame counts missing' "$tmp/out"
+grep -Eq '^ms/frame +550.000 +500.000 +-50.000' "$tmp/out"
+echo '14 checks passed'

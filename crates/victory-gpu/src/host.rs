@@ -1525,9 +1525,15 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+        // Diagnostics must report each drained sample: otherwise four of
+        // five one-second windows (including per-shader drops) disappear.
+        // Keep the ordinary release log cadence unchanged.
+        if cfg!(feature = "diagnostics")
+            || self.logged.elapsed() >= std::time::Duration::from_secs(5)
+        {
             self.logged = std::time::Instant::now();
             tracing::info!(
+                sample_frames = frames as u32,
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \

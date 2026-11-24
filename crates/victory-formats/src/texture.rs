@@ -594,7 +594,73 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        // Small mips, linear layouts and 3D textures keep the serial path.
+        // Large tiled 2D mips have independent destination rows.
+        static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let workers = *WORKERS.get_or_init(|| {
+            std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
+        });
+        self.detile_with_workers(tiled, mip, slice, linear, row_pitch, depth_pitch, workers)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn detile_with_workers(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+        workers: usize,
+    ) -> Result<(), Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let active = m.width as usize * self.desc.element_bytes as usize;
+        let rows = m.height as usize;
+        if workers > 1
+            && self.desc.dimension == Dimension::Tex2d
+            && m.depth == 1
+            && self.desc.swizzle != Swizzle::LINEAR
+            && rows >= 128
+            && active.saturating_mul(rows) >= 1 << 20
+        {
+            // Validate the complete destination before splitting it. The
+            // final row need not have trailing pitch padding.
+            let need = (rows - 1)
+                .checked_mul(row_pitch)
+                .and_then(|offset| offset.checked_add(active))
+                .ok_or(Error::TooSmall)?;
+            if row_pitch < active || linear.len() < need {
+                return Err(Error::TooSmall);
+            }
+            let stripe = rows.div_ceil(workers.min(4)).max(64);
+            let chunk_bytes = stripe.checked_mul(row_pitch).ok_or(Error::TooSmall)?;
+            return std::thread::scope(|scope| {
+                let handles: Vec<_> = linear[..need]
+                    .chunks_mut(chunk_bytes)
+                    .enumerate()
+                    .map(|(i, output)| {
+                        let first = i * stripe;
+                        let end = (first + stripe).min(rows);
+                        scope.spawn(move || {
+                            self.walk(
+                                tiled.len(), mip, slice, need, row_pitch, depth_pitch,
+                                Some(first as u32..end as u32),
+                                |t, l, len| {
+                                    let local = l - first * row_pitch;
+                                    output[local..][..len].copy_from_slice(&tiled[t..][..len]);
+                                },
+                            )
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle.join().expect("detile worker panicked")?;
+                }
+                Ok(())
+            });
+        }
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, None, |t, l, len| {
             linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
         })
     }
@@ -609,7 +675,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, None, |t, l, len| {
             tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
         })
     }
@@ -624,6 +690,7 @@ impl Layout {
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
+        row_range: Option<std::ops::Range<u32>>,
         mut copy: impl FnMut(usize, usize, usize),
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
@@ -674,7 +741,7 @@ impl Layout {
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
+            for y in row_range.clone().unwrap_or(0..m.height) {
                 let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
@@ -830,6 +897,36 @@ mod tests {
             block: 1,
             samples: 1,
             swizzle,
+        }
+    }
+
+    #[test]
+    fn parallel_large_tiled_rows_match_serial_with_padding_and_short_final_row() {
+        for swizzle in [Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+            let l = Layout::new(&Desc {
+                depth: 2,
+                ..desc(1025, 257, 2, 4, swizzle)
+            }).unwrap();
+            let tiled: Vec<_> = (0..l.size as usize)
+                .map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8)
+                .collect();
+            let pitch = 1025 * 4 + 19;
+            let need = 256 * pitch + 1025 * 4;
+            for slice in 0..2 {
+                let mut serial = vec![0xcc; need];
+                l.detile_with_workers(&tiled, 0, slice, &mut serial, pitch, need, 1).unwrap();
+                for workers in [2, 3, 4, 8] {
+                    let mut parallel = vec![0xcc; need];
+                    l.detile_with_workers(&tiled, 0, slice, &mut parallel, pitch, need, workers).unwrap();
+                    assert_eq!(parallel, serial);
+                }
+                let mut short = vec![0xcc; need - 1];
+                assert_eq!(
+                    l.detile_with_workers(&tiled, 0, slice, &mut short, pitch, need, 4),
+                    Err(Error::TooSmall)
+                );
+                assert!(short.iter().all(|&b| b == 0xcc));
+            }
         }
     }
 

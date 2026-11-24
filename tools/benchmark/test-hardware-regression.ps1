@@ -66,3 +66,6 @@ try {
     Assert ($LASTEXITCODE -eq 2) 'CLI invalid input.'
 }finally{Remove-Item -LiteralPath $dir -Recurse -Force}
 Write-Host 'Hardware regression tests passed.'
+# Expected nonzero child exit codes were asserted above. Do not propagate
+# the last child status to the GitHub Actions PowerShell wrapper.
+exit 0

@@ -304,6 +304,12 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             }
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
+            let sub = b.second as u32;
+            let texture = crate::resource::host_resource(b.first)?;
+            if sub != u32::MAX && !valid_texture_subresource(texture, sub) {
+                tracing::warn!(sub, "texture transition names an invalid subresource");
+                return None;
+            }
             let wanted = crate::host::texture_state(b.last as u32);
             let (texture, before) = list.transition(b.first, wanted)?;
             Some(Barrier {
@@ -481,6 +487,50 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
+/// D3D12 subresource indices enumerate mips, array slices, then planes.
+/// For 3D textures depth slices are part of a mip, not array subresources.
+#[cfg(windows)]
+fn subresource_index_valid(index: u32, mips: u16, arrays: u16, planes: u8) -> bool {
+    u64::from(index) < u64::from(mips) * u64::from(arrays) * u64::from(planes)
+}
+
+#[cfg(windows)]
+fn valid_texture_subresource(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    index: u32,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    // SAFETY: a live host texture.
+    let desc = unsafe { texture.GetDesc() };
+    let arrays = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        desc.DepthOrArraySize
+    };
+    // The common plane-zero path needs no feature query. For another
+    // plane use the actual host format, not the guest's console format.
+    if subresource_index_valid(index, desc.MipLevels, arrays, 1) {
+        return true;
+    }
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+        Format: desc.Format,
+        ..Default::default()
+    };
+    // SAFETY: the feature query writes the indicated local structure.
+    let known = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_INFO,
+            (&raw mut info).cast(),
+            size_of_val(&info) as u32,
+        )
+    };
+    known.is_ok()
+        && subresource_index_valid(index, desc.MipLevels, arrays, info.PlaneCount)
+}
+
 /// Texture to texture on the GPU; buffer to texture through an upload
 /// buffer filled at submission. Texture to buffer (read back) is not done
 /// yet.
@@ -511,6 +561,16 @@ extern "system" fn copy_texture_region(
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
+        // The subresource index occupies the low dword of the copy
+        // location's union (represented here by PlacedFootprint).
+        if dst.kind != 0 || !valid_texture_subresource(to, dst.footprint.offset as u32) {
+            tracing::warn!(kind = dst.kind, "invalid texture copy destination subresource");
+            return;
+        }
+        if src.kind != 0 && src.kind != FOOTPRINT {
+            tracing::warn!(kind = src.kind, "unknown texture copy source location");
+            return;
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -540,6 +600,10 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if !valid_texture_subresource(texture, src.footprint.offset as u32) {
+                tracing::warn!("invalid texture copy source subresource");
+                return;
+            }
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
@@ -629,6 +693,10 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        if !valid_texture_subresource(to, dst_sub) || !valid_texture_subresource(from, src_sub) {
+            tracing::warn!(dst_sub, src_sub, "resolve names an invalid subresource");
+            return;
+        }
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
@@ -1404,6 +1472,22 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_subresource_indices_respect_mips_arrays_and_planes() {
+        assert!(subresource_index_valid(11, 3, 2, 2));
+        assert!(!subresource_index_valid(12, 3, 2, 2));
+        assert!(subresource_index_valid(5, 3, 2, 1));
+        assert!(!subresource_index_valid(6, 3, 2, 1));
+        // 3D uses one array slice, regardless of its depth.
+        assert!(subresource_index_valid(3, 4, 1, 1));
+        assert!(!subresource_index_valid(4, 4, 1, 1));
+        assert!(!subresource_index_valid(0, 0, 1, 1));
+        assert!(!subresource_index_valid(0, 1, 0, 1));
+        assert!(!subresource_index_valid(0, 1, 1, 0));
+        assert!(subresource_index_valid(u32::MAX, u16::MAX, u16::MAX, 2));
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

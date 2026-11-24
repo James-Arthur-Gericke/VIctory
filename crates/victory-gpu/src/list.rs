@@ -349,6 +349,27 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+/// Preserve the caller's order when a buffer barrier must be replaced by
+/// a global UAV barrier. Moving all buffer ordering to the end can reorder
+/// it relative to a following texture transition or aliasing barrier.
+#[cfg(windows)]
+fn ordered_barriers(
+    barriers: &[Barrier],
+    mut translate: impl FnMut(&Barrier) -> Option<Barrier>,
+    mut buffer_order: impl FnMut(&Barrier) -> bool,
+) -> Vec<Barrier> {
+    let mut host = Vec::with_capacity(barriers.len());
+    for b in barriers {
+        if let Some(mapped) = translate(b) {
+            host.push(mapped);
+        }
+        if buffer_order(b) {
+            host.push(UAV_BARRIER);
+        }
+    }
+    host
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -357,17 +378,13 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
-        // Buffers have host copies, not resources the barrier can name:
-        // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
-            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
-            host.push(UAV_BARRIER);
-        }
+        let host = ordered_barriers(
+            barriers,
+            |b| host_barrier(list, b),
+            |b| {
+                b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
+            },
+        );
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -1404,6 +1421,29 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn buffer_ordering_stays_between_texture_barriers() {
+        // Synthetic barrier identifiers in last; callbacks do not access
+        // any resource or need a device.
+        let named = |kind, last| Barrier { kind, last, ..UAV_BARRIER };
+        let input = [
+            named(0, 10),
+            named(2, 20),
+            named(1, 30),
+            named(0, 40),
+            named(2, 50),
+        ];
+        let output = ordered_barriers(
+            &input,
+            |b| (!matches!(b.last, 20 | 50)).then_some(*b),
+            |b| matches!(b.last, 20 | 50),
+        );
+        let order: Vec<_> = output.iter().map(|b| (b.kind, b.last)).collect();
+        assert_eq!(order, vec![(0, 10), (2, 0), (1, 30), (0, 40), (2, 0)]);
+        assert!(ordered_barriers(&[], |_| None, |_| false).is_empty());
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

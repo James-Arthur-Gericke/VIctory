@@ -31,3 +31,45 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      - name: Tests, diagnostics build
+        run: cargo test --workspace --all-features --locked
+      - name: PresentMon benchmark statistics tests
+        shell: pwsh
+        run: ./tools/benchmark/test-present-metrics.ps1
+      - name: Present regression gate tests
+        shell: pwsh
+        run: ./tools/benchmark/test-regression-metrics.ps1
+      - name: Diagnostic log comparator tests
+        shell: bash
+        run: sh tools/diagnostics/test-compare-logs.sh
+
+  hardware-build:
+    # Hosted build only: never run a title or access a physical test PC.
+    if: github.event_name == 'pull_request'
+    needs: check
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release and diagnostics
+        shell: pwsh
+        run: |
+          cargo build --locked --release -p victory
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --profile diag -p victory --features diagnostics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Smoke test and package
+        shell: pwsh
+        run: ./tools/benchmark/Package-HardwareBuild.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'victory-hardware')
+      - name: Upload experimental binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: victory-hardware-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/victory-hardware/
+          if-no-files-found: error
+          retention-days: 7

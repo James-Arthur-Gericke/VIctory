@@ -52,9 +52,32 @@ pub(crate) struct Staging {
 /// with room to read the memory into.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
-    asked: u64,
+    stamp: Stamp,
     read: Vec<u8>,
+}
+
+/// The source of the last successful detile. A watch epoch and a content
+/// hash from different refresh paths must not both describe the staging bytes.
+#[derive(Default, PartialEq, Eq)]
+enum Stamp {
+    #[default]
+    Unknown,
+    Watched(u64),
+    Hashed(blake3::Hash),
+}
+
+impl Stamp {
+    fn watched_current(&self, written: &[(usize, u64)]) -> bool {
+        matches!(self, Self::Watched(asked) if written.iter().all(|&(_, w)| w <= *asked))
+    }
+
+    fn refresh(&mut self, next: Self, detile: impl FnOnce() -> bool) {
+        // A failed conversion can have changed only part of the staging buffer.
+        *self = Self::Unknown;
+        if detile() {
+            *self = next;
+        }
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -188,20 +211,21 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            if last.stamp.watched_current(&written) {
                 return 0;
             }
-            last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            let (stamp, read) = (&mut last.stamp, &last.read);
+            stamp.refresh(Stamp::Watched(now), || self.detile(read));
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
         if !committed(self.memory, size) {
+            last.stamp = Stamp::Unknown;
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -216,18 +240,17 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if last.stamp == Stamp::Hashed(hash) {
             return size;
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
+        last.stamp.refresh(Stamp::Hashed(hash), || self.detile(tiled));
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    fn detile(&self, tiled: &[u8]) -> bool {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -250,9 +273,10 @@ impl Staging {
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                return false;
             }
         }
+        true
     }
 }
 
@@ -341,4 +365,45 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn texture_stamp_tracks_only_the_last_successful_source() {
+        let a = blake3::hash(b"synthetic A");
+        let b = blake3::hash(b"synthetic B");
+        let mut stamp = Stamp::default();
+        assert!(!stamp.watched_current(&[]));
+        stamp.refresh(Stamp::Hashed(a), || true);
+        assert!(!stamp.watched_current(&[]));
+        stamp.refresh(Stamp::Watched(10), || true);
+        assert!(stamp.watched_current(&[(0, 10)]));
+        assert!(!stamp.watched_current(&[(0, 11)]));
+        assert!(stamp != Stamp::Hashed(a));
+
+        stamp.refresh(Stamp::Hashed(b), || true);
+        assert!(stamp == Stamp::Hashed(b));
+        assert!(!stamp.watched_current(&[]));
+    }
+
+    #[test]
+    fn failed_texture_detile_invalidates_the_previous_stamp() {
+        let a = blake3::hash(b"synthetic A");
+        let b = blake3::hash(b"synthetic B");
+        let mut stamp = Stamp::Hashed(a);
+        stamp.refresh(Stamp::Watched(5), || false);
+        assert!(stamp == Stamp::Unknown);
+        assert!(!stamp.watched_current(&[]));
+        stamp.refresh(Stamp::Watched(5), || true);
+        assert!(stamp.watched_current(&[]));
+
+        stamp.refresh(Stamp::Hashed(b), || false);
+        assert!(stamp == Stamp::Unknown);
+        assert!(stamp != Stamp::Hashed(b));
+        stamp.refresh(Stamp::Hashed(b), || true);
+        assert!(stamp == Stamp::Hashed(b));
+    }
 }

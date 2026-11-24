@@ -341,9 +341,9 @@ fn rgb_stats(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Opti
         pixels: w.checked_mul(h)?,
     };
     for y in 0..h {
-        for p in rows[y * pitch..y * pitch + row_bytes].chunks_exact(4) {
+        for p in rows[y * pitch..y * pitch + row_bytes].as_chunks::<4>().0 {
             let peak = if max_code == 1023 {
-                let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                let v = u32::from_le_bytes(*p);
                 (v & 1023).max((v >> 10) & 1023).max((v >> 20) & 1023)
             } else {
                 u32::from(p[0].max(p[1]).max(p[2]))

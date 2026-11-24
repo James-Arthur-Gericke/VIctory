@@ -253,6 +253,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retained_objects_keep_one_owner_per_identity_until_reset() {
+        use std::sync::Arc;
+        let a = Arc::new(7u32);
+        let b = Arc::new(7u32);
+        let mut retained = std::collections::HashMap::new();
+        for _ in 0..100 {
+            retain_once(&mut retained, Arc::as_ptr(&a) as usize, a.clone());
+            retain_once(&mut retained, Arc::as_ptr(&b) as usize, b.clone());
+        }
+        assert_eq!(retained.len(), 2);
+        assert_eq!(Arc::strong_count(&a), 2);
+        assert_eq!(Arc::strong_count(&b), 2);
+        let weak = Arc::downgrade(&a);
+        drop(a);
+        assert!(weak.upgrade().is_some());
+        retained.clear();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(Arc::strong_count(&b), 1);
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -318,6 +339,11 @@ const STAMPS: u32 = 4096;
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
+
+// The first owning reference is retained, not replaced by later calls.
+fn retain_once<T>(objects: &mut std::collections::HashMap<usize, T>, identity: usize, object: T) {
+    objects.entry(identity).or_insert(object);
+}
 
 type States = std::collections::HashMap<
     usize,
@@ -400,7 +426,7 @@ struct Deferred {
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
-    kept: Vec<windows::core::IUnknown>,
+    kept: std::collections::HashMap<usize, windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -1130,10 +1156,12 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
-    /// Keeps `object` alive until the list is reset.
+    /// Keeps one owning reference per COM identity until the list is
+    /// reset. The retained IUnknown prevents identity-address reuse.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+            let identity = object.as_raw() as usize;
+            retain_once(&mut self.deferred().kept, identity, object);
         }
     }
 

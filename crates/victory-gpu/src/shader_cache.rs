@@ -375,11 +375,41 @@ mod tests {
         assert_eq!(decode(&encode(&s)), None);
 
         s.user_data = (0..64)
-            .map(|index| UserData { index, ..s.user_data[0] })
+            .map(|index| UserData {
+                index,
+                ..s.user_data[0]
+            })
             .collect();
         assert_eq!(decode(&encode(&s)), Some(s.clone()));
         s.user_data.push(s.user_data[0]);
         assert_eq!(decode(&encode(&s)), None);
+    }
+
+    #[test]
+    fn invalid_cached_index_is_retranslated() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [9u8; 32];
+        let container = b"synthetic container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        let mut invalid = shader();
+        invalid.user_data[0].index = u32::MAX;
+        let files = walk(dir.path());
+        assert!(!files.is_empty());
+        for path in files {
+            std::fs::write(path, encode(&invalid)).unwrap();
+        }
+
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
     }
 
     #[test]

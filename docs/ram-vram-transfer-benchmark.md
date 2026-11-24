@@ -4,7 +4,11 @@ Standalone Windows CLI, no title assets or execution. Start with verified WARP:
 
     victory-diag.exe transfer-benchmark --region-bytes 4096 --repeats 1
 
-On a supervised physical test machine only, explicitly select the correct DXGI adapter index (confirm vendor/device/LUID in output). Example index 0 is not guaranteed to be the RTX 5090:
+List the DXGI adapters before choosing an index. This only queries adapter descriptions and does not create a D3D12 device or submit transfers:
+
+    victory-diag.exe transfer-benchmark --list-adapters
+
+On a supervised physical test machine, pass the index of the intended hardware adapter and confirm its vendor, device, and LUID in the benchmark output. Adapter indices depend on the machine:
 
     victory-diag.exe transfer-benchmark --adapter 0 --region-bytes 262144 --repeats 3
 

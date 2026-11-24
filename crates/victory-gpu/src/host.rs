@@ -253,6 +253,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deferred_shadow_owners_are_interned_without_losing_step_identity() {
+        use std::sync::Arc;
+        let a = Arc::new(5u32);
+        let b = Arc::new(5u32);
+        let mut owners = std::collections::HashMap::new();
+        let keys: Vec<_> = [&a, &b, &a, &a, &b]
+            .into_iter()
+            .map(|owner| retain_shadow(&mut owners, owner))
+            .collect();
+        assert_eq!(keys[0], keys[2]);
+        assert_eq!(keys[0], keys[3]);
+        assert_eq!(keys[1], keys[4]);
+        assert_ne!(keys[0], keys[1]);
+        assert_eq!(owners.len(), 2);
+        assert_eq!(Arc::strong_count(&a), 2);
+        assert_eq!(Arc::strong_count(&b), 2);
+        let weak = Arc::downgrade(&a);
+        drop(a);
+        assert_eq!(*owners[&keys[0]], 5);
+        owners.clear();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(Arc::strong_count(&b), 1);
+    }
+
+    #[test]
     fn retained_objects_keep_one_owner_per_identity_until_reset() {
         use std::sync::Arc;
         let a = Arc::new(7u32);
@@ -345,6 +370,17 @@ fn retain_once<T>(objects: &mut std::collections::HashMap<usize, T>, identity: u
     objects.entry(identity).or_insert(object);
 }
 
+// Keep one owner per shadow identity for every deferred step on this list.
+// The retained Arc prevents its allocation address from being reused.
+fn retain_shadow<T>(
+    owners: &mut std::collections::HashMap<usize, std::sync::Arc<T>>,
+    shadow: &std::sync::Arc<T>,
+) -> usize {
+    let key = std::sync::Arc::as_ptr(shadow) as usize;
+    owners.entry(key).or_insert_with(|| shadow.clone());
+    key
+}
+
 type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
@@ -403,13 +439,13 @@ enum Step {
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
-    Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    Refresh(usize, usize, usize),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    GpuWrite(usize, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -427,6 +463,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: std::collections::HashMap<usize, windows::core::IUnknown>,
+    /// Owners named by Refresh and GpuWrite steps, until reset.
+    shadows: std::collections::HashMap<usize, std::sync::Arc<crate::shadow::Shadow>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -608,13 +646,15 @@ impl Host {
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
+            let deferred = list.deferred();
+            for step in &deferred.copies {
+                if let Step::GpuWrite(key, address, len) = step {
+                    let shadow = &deferred.shadows[key];
+                    if !back.iter().any(|(s, a, l)| {
+                        std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
+                    }) {
+                        back.push((shadow.clone(), *address, *len));
+                    }
                 }
             }
         }
@@ -1067,9 +1107,8 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
-            deferred
-                .copies
-                .push(Step::Refresh(shadow.clone(), address, len));
+            let owner = retain_shadow(&mut deferred.shadows, shadow);
+            deferred.copies.push(Step::Refresh(owner, address, len));
         }
     }
 
@@ -1081,9 +1120,9 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let owner = retain_shadow(&mut deferred.shadows, shadow);
+        deferred.copies.push(Step::GpuWrite(owner, address, len));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -1195,7 +1234,8 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let deferred = self.deferred();
+        for step in &deferred.copies {
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -1217,13 +1257,13 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
-                Step::Refresh(shadow, address, len) => {
+                Step::Refresh(key, address, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
-                    batch.add(shadow, *address, *len);
+                    batch.add(&deferred.shadows[key], *address, *len);
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
@@ -1238,10 +1278,10 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(key, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
-                    shadow.writing(*address, *len);
+                    deferred.shadows[key].writing(*address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {

@@ -43,6 +43,14 @@ BEGIN {
         sum[side,1]+=metric(line," fps,"); sum[side,2]+=metric(line," ms/frame")
         sum[side,3]+=metric(line," draws/frame,"); sum[side,4]+=metric(line," without a host pipeline")
         sum[side,5]+=metric(line," being made"); sum[side,6]+=metric(line," indirect")
+        if (match(line, /sample_frames=[1-9][0-9]*/)) {
+            w=substr(line,RSTART+14,RLENGTH-14)+0
+            weights[side]+=w; weighted_samples[side]++
+            weighted[side,2]+=w*metric(line," ms/frame")
+            weighted[side,3]+=w*metric(line," draws/frame,")
+            weighted[side,4]+=w*metric(line," without a host pipeline")
+            weighted[side,6]+=w*metric(line," indirect")
+        }
         next
     }
     if (active && line ~ /dropped [0-9.]+\/frame without a host pipeline: /) {
@@ -56,10 +64,18 @@ END {
     if (selected[1]!=be-bs+1 || selected[2]!=ce-cs+1) {
         print "invalid window or missing recognized UTF-8 summaries" > "/dev/stderr"; exit 2
     }
-    print "Sample means (not whole-run frame means); missing details are not zero."
+    use_weights=(weighted_samples[1]==selected[1] && weighted_samples[2]==selected[2])
+    if (use_weights) print "Frame-weighted estimates over reported samples; pending pipelines and reason details remain sample means."
+    else print "Sample means (not whole-run frame means); frame counts missing in at least one window."
+    print "Missing details are not zero."
     printf "%-24s %12s %12s %12s\n","metric","baseline","candidate","delta"
     for(i=1;i<=6;i++) {
         a=sum[1,i]/selected[1]; b=sum[2,i]/selected[2]
+        if (use_weights && i==1 && weighted[1,2]>0 && weighted[2,2]>0) {
+            a=1000*weights[1]/weighted[1,2]; b=1000*weights[2]/weighted[2,2]
+        } else if (use_weights && i!=1 && i!=5) {
+            a=weighted[1,i]/weights[1]; b=weighted[2,i]/weights[2]
+        }
         printf "%-24s %12.3f %12.3f %+12.3f\n",names[i],a,b,b-a
     }
     for (key in listed) {

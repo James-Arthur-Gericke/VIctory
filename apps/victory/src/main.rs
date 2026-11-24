@@ -87,6 +87,9 @@ enum Command {
     },
     /// Synthetic upload/default/readback benchmark; verified WARP by default.
     TransferBenchmark {
+        /// List DXGI adapter indices without running a transfer.
+        #[arg(long, conflicts_with_all = ["adapter", "region_bytes", "repeats"])]
+        list_adapters: bool,
         /// Explicit DXGI adapter index for supervised physical hardware testing.
         #[arg(long)]
         adapter: Option<u32>,
@@ -165,11 +168,26 @@ fn main() -> Result<()> {
             list,
             jobs,
         } => translate::run(paths, validate, pipelines, list, jobs),
-        Command::TransferBenchmark { adapter, region_bytes, repeats } => {
+        Command::TransferBenchmark {
+            list_adapters,
+            adapter,
+            region_bytes,
+            repeats,
+        } => {
             #[cfg(windows)]
-            { victory_shader::emit::host::transfer::run(adapter, region_bytes, repeats).map_err(anyhow::Error::msg) }
+            {
+                use victory_shader::emit::host::transfer;
+                if list_adapters {
+                    transfer::list_adapters().map_err(anyhow::Error::msg)
+                } else {
+                    transfer::run(adapter, region_bytes, repeats).map_err(anyhow::Error::msg)
+                }
+            }
             #[cfg(not(windows))]
-            { let _ = (adapter, region_bytes, repeats); anyhow::bail!("transfer benchmark requires Windows") }
+            {
+                let _ = (list_adapters, adapter, region_bytes, repeats);
+                anyhow::bail!("transfer benchmark requires Windows")
+            }
         }
         Command::Run {
             exe,

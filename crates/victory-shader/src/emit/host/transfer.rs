@@ -183,6 +183,38 @@ fn sample(dev: &ID3D12Device, bytes: usize, pooled: bool) -> Result<Sample, Stri
     }
 }
 
+/// List the same DXGI indices accepted by the transfer benchmark.
+pub fn list_adapters() -> Result<(), String> {
+    // SAFETY: the factory and adapters are owned COM handles. Only DXGI enumeration
+    // and descriptor queries are performed here.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+        for index in 0.. {
+            let adapter = match factory.EnumAdapters1(index) {
+                Ok(adapter) => adapter,
+                Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(error) => return Err(err(error)),
+            };
+            let desc = adapter.GetDesc1().map_err(err)?;
+            let name = String::from_utf16_lossy(&desc.Description);
+            let kind = if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                "software"
+            } else {
+                "hardware"
+            };
+            println!(
+                "{index}: {} ({kind}) vendor={:#06x} device={:#06x} luid={:08x}:{:08x}",
+                name.trim_end_matches('\0'),
+                desc.VendorId,
+                desc.DeviceId,
+                desc.AdapterLuid.HighPart as u32,
+                desc.AdapterLuid.LowPart,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Explicit adapter index for physical hardware, otherwise verified WARP.
 /// The benchmark is bounded and must be invoked as a standalone CLI.
 pub fn run(adapter: Option<u32>, region_bytes: usize, repeats: u32) -> Result<(), String> {

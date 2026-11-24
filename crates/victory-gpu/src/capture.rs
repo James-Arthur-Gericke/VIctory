@@ -281,6 +281,21 @@ fn dump_one(
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        if let Some(stats) = rgb_stats(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+            tracing::info!(
+                frame,
+                target = i,
+                ?resource,
+                format = f.Format.0,
+                width = f.Width,
+                height = f.Height,
+                rgb_peak = stats.peak,
+                rgb_max_code = stats.max_code,
+                nonzero_pixels = stats.nonzero,
+                pixels = stats.pixels,
+                "scene target raw RGB"
+            );
+        }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
@@ -292,6 +307,52 @@ fn dump_one(
         }
         buffer.Unmap(0, None);
     }
+}
+
+/// Native UNORM code values before PNG contrast scaling. Alpha and row
+/// padding are deliberately excluded. Do not interpret float, typeless,
+/// integer or XR-bias formats as ordinary UNORM.
+#[derive(Debug, PartialEq, Eq)]
+struct RgbStats {
+    peak: u32,
+    max_code: u32,
+    nonzero: usize,
+    pixels: usize,
+}
+
+fn rgb_stats(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<RgbStats> {
+    let max_code = match format {
+        28 | 29 | 87 | 88 | 91 | 93 => 255,
+        24 => 1023,
+        _ => return None,
+    };
+    let row_bytes = w.checked_mul(4)?;
+    if w == 0 || h == 0 || pitch < row_bytes {
+        return None;
+    }
+    let used = (h - 1).checked_mul(pitch)?.checked_add(row_bytes)?;
+    if used > rows.len() {
+        return None;
+    }
+    let mut stats = RgbStats {
+        peak: 0,
+        max_code,
+        nonzero: 0,
+        pixels: w.checked_mul(h)?,
+    };
+    for y in 0..h {
+        for p in rows[y * pitch..y * pitch + row_bytes].chunks_exact(4) {
+            let peak = if max_code == 1023 {
+                let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                (v & 1023).max((v >> 10) & 1023).max((v >> 20) & 1023)
+            } else {
+                u32::from(p[0].max(p[1]).max(p[2]))
+            };
+            stats.peak = stats.peak.max(peak);
+            stats.nonzero += usize::from(peak != 0);
+        }
+    }
+    Some(stats)
 }
 
 fn half(h: u16) -> f32 {
@@ -520,6 +581,33 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scene_rgb_stats_exclude_alpha_and_row_padding() {
+        let rows = [0, 0, 0, 255, 2, 1, 0, 255, 255, 255, 255, 255,
+                    0, 0, 0, 255, 0, 0, 0, 255];
+        for format in [28, 29, 87, 88, 91, 93] {
+            assert_eq!(
+                super::rgb_stats(format, 2, 2, 12, &rows),
+                Some(super::RgbStats { peak: 2, max_code: 255, nonzero: 1, pixels: 4 })
+            );
+        }
+    }
+
+    #[test]
+    fn scene_rgb_stats_preserve_ten_bit_precision() {
+        let rows = [3u32 << 30, (3u32 << 30) | (4 << 20)];
+        let bytes: Vec<u8> = rows.into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(
+            super::rgb_stats(24, 2, 1, 8, &bytes),
+            Some(super::RgbStats { peak: 4, max_code: 1023, nonzero: 1, pixels: 2 })
+        );
+        assert_eq!(super::rgb_stats(24, 2, 1, 8, &bytes[..7]), None);
+        assert_eq!(super::rgb_stats(24, 2, 1, 4, &bytes), None);
+        assert_eq!(super::rgb_stats(89, 2, 1, 8, &bytes), None);
+        assert_eq!(super::rgb_stats(24, 0, 1, 8, &bytes), None);
+        assert_eq!(super::rgb_stats(24, usize::MAX, 1, 8, &bytes), None);
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

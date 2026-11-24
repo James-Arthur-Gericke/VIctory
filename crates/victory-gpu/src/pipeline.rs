@@ -107,7 +107,11 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = crate::shader_cache::profile(
+                    crate::shader_cache::ProfilePhase::FirstUse,
+                    || translate(&self.container),
+                    Result::is_ok,
+                );
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,

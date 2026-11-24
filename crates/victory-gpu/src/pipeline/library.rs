@@ -146,6 +146,13 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    // Wrap driver creation independently from library loads. This also
+    // covers the path where a pipeline library is unavailable.
+    let create = || crate::shader_cache::profile(
+        crate::shader_cache::ProfilePhase::DriverCreate,
+        create,
+        Result::is_ok,
+    );
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);

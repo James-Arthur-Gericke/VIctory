@@ -21,6 +21,98 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
+/// Inclusive phases: cache requests can contain translation and encoding,
+/// and first use can contain all the shader phases. Do not sum their times.
+#[derive(Clone, Copy)]
+pub(crate) enum ProfilePhase {
+    FirstUse,
+    Translate,
+    Encode,
+    CacheRequest,
+    ReadDecode,
+    DriverCreate,
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Sample {
+    calls: u64,
+    failures: u64,
+    total_us: u64,
+    max_us: u64,
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+impl Sample {
+    const EMPTY: Self = Self { calls: 0, failures: 0, total_us: 0, max_us: 0 };
+
+    fn record(&mut self, us: u64, ok: bool) {
+        self.calls = self.calls.saturating_add(1);
+        self.failures = self.failures.saturating_add(u64::from(!ok));
+        self.total_us = self.total_us.saturating_add(us);
+        self.max_us = self.max_us.max(us);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+const PHASE_NAMES: [&str; 6] = [
+    "first-use", "translate", "encode", "cache-request-inclusive",
+    "cache-read-decode", "driver-create",
+];
+
+#[cfg(feature = "diagnostics")]
+static PROFILE: std::sync::Mutex<[Sample; PHASE_NAMES.len()]> =
+    std::sync::Mutex::new([Sample::EMPTY; PHASE_NAMES.len()]);
+
+#[cfg(feature = "diagnostics")]
+fn profiling() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_SHADER_PROFILE").is_some())
+}
+
+pub(crate) fn profile<T>(
+    phase: ProfilePhase,
+    work: impl FnOnce() -> T,
+    success: impl FnOnce(&T) -> bool,
+) -> T {
+    #[cfg(feature = "diagnostics")]
+    if profiling() {
+        let started = std::time::Instant::now();
+        let result = work();
+        let us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        PROFILE.lock().unwrap_or_else(|e| e.into_inner())[phase as usize]
+            .record(us, success(&result));
+        return result;
+    }
+    let _ = (phase, success);
+    work()
+}
+
+/// Completed calls since the previous report, grouped by phase. Worker
+/// times overlap and are cumulative CPU-side elapsed time, not wall time.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_profile() {
+    if !profiling() {
+        return;
+    }
+    let samples = std::mem::replace(
+        &mut *PROFILE.lock().unwrap_or_else(|e| e.into_inner()),
+        [Sample::EMPTY; PHASE_NAMES.len()],
+    );
+    for (phase, s) in PHASE_NAMES.into_iter().zip(samples) {
+        if s.calls != 0 {
+            tracing::info!(
+                phase,
+                calls = s.calls,
+                failures = s.failures,
+                total_us = s.total_us,
+                max_us = s.max_us,
+                "shader compilation profile (inclusive worker elapsed time)"
+            );
+        }
+    }
+}
+
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
     match Cache::open(dir) {
@@ -75,7 +167,7 @@ pub(crate) fn host_shader(
 ) -> Result<HostShader, String> {
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
-        None => translate(container),
+        None => profile(ProfilePhase::Translate, || translate(container), Result::is_ok),
     }
 }
 
@@ -96,8 +188,12 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let shader = profile(
+            ProfilePhase::Translate,
+            || (self.translate)(&input[32..]),
+            Result::is_ok,
+        ).map_err(anyhow::Error::msg)?;
+        Ok(profile(ProfilePhase::Encode, || encode(&shader), |_| true))
     }
 }
 
@@ -113,10 +209,16 @@ fn cached(
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        let path = profile(
+            ProfilePhase::CacheRequest,
+            || cache.get_or_convert(&converter, &input),
+            Result::is_ok,
+        ).map_err(|e| format!("{e:#}"))?;
+        if let Some(shader) = profile(
+            ProfilePhase::ReadDecode,
+            || std::fs::read(&path).ok().and_then(|b| decode(&b)),
+            Option::is_some,
+        ) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
@@ -130,7 +232,7 @@ fn cached(
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    profile(ProfilePhase::Translate, || (converter.translate)(container), Result::is_ok)
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
@@ -316,6 +418,26 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
         }
+    }
+
+    #[test]
+    fn profile_samples_count_failures_and_saturate() {
+        let mut s = Sample::EMPTY;
+        s.record(4, true);
+        s.record(10, false);
+        s.record(0, true);
+        assert_eq!(s, Sample { calls: 3, failures: 1, total_us: 14, max_us: 10 });
+        s.record(u64::MAX, false);
+        assert_eq!(s.total_us, u64::MAX);
+        assert_eq!(s.max_us, u64::MAX);
+        let previous = std::mem::replace(&mut s, Sample::EMPTY);
+        assert_eq!(previous.calls, 4);
+        assert_eq!(previous.failures, 2);
+        assert_eq!(s, Sample::default());
+
+        // The wrapper must preserve success/failure values.
+        assert_eq!(profile(ProfilePhase::Translate, || Ok::<_, &str>(7), Result::is_ok), Ok(7));
+        assert_eq!(profile(ProfilePhase::Translate, || Err::<(), _>("unsupported"), Result::is_ok), Err("unsupported"));
     }
 
     #[test]

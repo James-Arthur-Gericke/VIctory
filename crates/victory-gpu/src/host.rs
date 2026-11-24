@@ -47,6 +47,8 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
+    #[cfg(feature = "diagnostics")]
+    budget_adapter: Option<IDXGIAdapter3>,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -75,6 +77,41 @@ unsafe impl Sync for Host {}
 /// detiling), then waiting for the GPU.
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// Diagnostics of the synchronous scheduling boundary. Queue wait is
+/// cumulative caller time, not GPU execution or elapsed wall time.
+#[cfg(any(test, feature = "diagnostics"))]
+#[derive(Default, Debug, PartialEq, Eq)]
+struct ScheduleSample {
+    calls: u64,
+    empty: u64,
+    lists: u64,
+    groups: u64,
+    wait_us: u64,
+    max_wait_us: u64,
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+impl ScheduleSample {
+    fn record(&mut self, lists: usize, groups: usize, wait_us: u64) {
+        self.calls += 1;
+        self.empty += u64::from(lists == 0);
+        self.lists += lists as u64;
+        self.groups += groups as u64;
+        self.wait_us += wait_us;
+        self.max_wait_us = self.max_wait_us.max(wait_us);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static SCHEDULE: Mutex<ScheduleSample> = Mutex::new(ScheduleSample {
+    calls: 0,
+    empty: 0,
+    lists: 0,
+    groups: 0,
+    wait_us: 0,
+    max_wait_us: 0,
+});
 
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
@@ -193,6 +230,8 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        #[cfg(feature = "diagnostics")]
+        let budget_adapter = budget_adapter(&device);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -220,6 +259,8 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             queue,
+            #[cfg(feature = "diagnostics")]
+            budget_adapter,
             fence,
             submitted: Mutex::new(0),
             event,
@@ -232,6 +273,59 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// Resolve the adapter by the device's LUID, not by enumeration order.
+#[cfg(feature = "diagnostics")]
+fn budget_adapter(device: &ID3D12Device) -> Option<IDXGIAdapter3> {
+    std::env::var_os("VICTORY_GPU_RESIDENCY")?;
+    // SAFETY: plain queries on a live device and factory.
+    let result = unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
+    };
+    match result {
+        Ok(adapter) => Some(adapter),
+        Err(e) => {
+            tracing::warn!(error = %e, "GPU memory budget monitoring unavailable");
+            None
+        }
+    }
+}
+
+/// Headroom is not physical free VRAM; the OS can change the budget.
+#[cfg(any(test, feature = "diagnostics"))]
+fn budget_balance(usage: u64, budget: u64) -> (u64, u64) {
+    (budget.saturating_sub(usage), usage.saturating_sub(budget))
+}
+
+#[cfg(feature = "diagnostics")]
+fn log_memory_budget(adapter: &IDXGIAdapter3) {
+    for (segment, label) in [
+        (DXGI_MEMORY_SEGMENT_GROUP_LOCAL, "local"),
+        (DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, "non-local"),
+    ] {
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: live adapter and a writable output structure; node zero
+        // is the primary physical node, not a sum across linked GPUs.
+        match unsafe { adapter.QueryVideoMemoryInfo(0, segment, &mut info) } {
+            Ok(()) => {
+                let (headroom, over_budget) = budget_balance(info.CurrentUsage, info.Budget);
+                tracing::info!(
+                    node = 0,
+                    segment = label,
+                    usage_bytes = info.CurrentUsage,
+                    budget_bytes = info.Budget,
+                    headroom_bytes = headroom,
+                    over_budget_bytes = over_budget,
+                    reservation_bytes = info.CurrentReservation,
+                    available_reservation_bytes = info.AvailableForReservation,
+                    "GPU memory budget sample"
+                );
+            }
+            Err(e) => tracing::debug!(node = 0, segment = label, error = %e, "GPU memory budget query failed"),
+        }
     }
 }
 
@@ -333,6 +427,100 @@ mod tests {
     }
 
     #[test]
+    fn memory_budget_balance_handles_over_budget_and_zero() {
+        assert_eq!(budget_balance(3, 8), (5, 0));
+        assert_eq!(budget_balance(8, 8), (0, 0));
+        assert_eq!(budget_balance(10, 8), (0, 2));
+        assert_eq!(budget_balance(0, 0), (0, 0));
+        assert_eq!(budget_balance(u64::MAX, 0), (0, u64::MAX));
+        assert_eq!(budget_balance(0, u64::MAX), (u64::MAX, 0));
+    }
+
+    #[test]
+    fn deferred_shadow_owners_are_interned_without_losing_step_identity() {
+        use std::sync::Arc;
+        let a = Arc::new(5u32);
+        let b = Arc::new(5u32);
+        let mut owners = std::collections::HashMap::new();
+        let keys: Vec<_> = [&a, &b, &a, &a, &b]
+            .into_iter()
+            .map(|owner| retain_shadow(&mut owners, owner))
+            .collect();
+        assert_eq!(keys[0], keys[2]);
+        assert_eq!(keys[0], keys[3]);
+        assert_eq!(keys[1], keys[4]);
+        assert_ne!(keys[0], keys[1]);
+        assert_eq!(owners.len(), 2);
+        assert_eq!(Arc::strong_count(&a), 2);
+        assert_eq!(Arc::strong_count(&b), 2);
+        let weak = Arc::downgrade(&a);
+        drop(a);
+        assert_eq!(*owners[&keys[0]], 5);
+        owners.clear();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(Arc::strong_count(&b), 1);
+    }
+
+    #[test]
+    fn retained_objects_keep_one_owner_per_identity_until_reset() {
+        use std::sync::Arc;
+        let a = Arc::new(7u32);
+        let b = Arc::new(7u32);
+        let mut retained = std::collections::HashMap::new();
+        for _ in 0..100 {
+            retain_once(&mut retained, Arc::as_ptr(&a) as usize, a.clone());
+            retain_once(&mut retained, Arc::as_ptr(&b) as usize, b.clone());
+        }
+        assert_eq!(retained.len(), 2);
+        assert_eq!(Arc::strong_count(&a), 2);
+        assert_eq!(Arc::strong_count(&b), 2);
+        let weak = Arc::downgrade(&a);
+        drop(a);
+        assert!(weak.upgrade().is_some());
+        retained.clear();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(Arc::strong_count(&b), 1);
+    }
+
+    #[test]
+    fn texture_upload_reuse_retains_only_a_used_chunk() {
+        use std::sync::Arc;
+        let owner = Arc::new(7u32);
+        let weak = Arc::downgrade(&owner);
+        let chunk = reset_texture_upload(Some((owner, 42, 513))).unwrap();
+        assert_eq!(chunk.1, 42);
+        assert_eq!(chunk.2, 0);
+        assert_eq!(texture_upload_range(chunk.2, 512), Some((0, 512)));
+        assert!(weak.upgrade().is_some());
+        // An idle recording releases the retained allocation.
+        assert!(reset_texture_upload(Some(chunk)).is_none());
+        assert!(weak.upgrade().is_none());
+        assert!(reset_texture_upload::<u32>(None).is_none());
+    }
+
+    #[test]
+    fn texture_upload_regions_are_aligned_disjoint_and_bounded() {
+        let mut used = 0;
+        for size in [1, 511, 512, 513, SMALL_TEXTURE_UPLOAD] {
+            let (offset, end) = texture_upload_range(used, size).unwrap();
+            assert_eq!(offset % 512, 0);
+            assert!(offset >= used);
+            assert_eq!(end - offset, size);
+            used = end;
+        }
+        assert_eq!(
+            texture_upload_range(TEXTURE_UPLOAD_CHUNK - 512, 512),
+            Some((TEXTURE_UPLOAD_CHUNK - 512, TEXTURE_UPLOAD_CHUNK))
+        );
+        assert_eq!(texture_upload_range(TEXTURE_UPLOAD_CHUNK - 511, 1), None);
+        assert_eq!(texture_upload_range(u64::MAX, 1), None);
+        assert_eq!(texture_upload_range(0, 0), None);
+        assert_eq!(texture_upload_range(0, SMALL_TEXTURE_UPLOAD + 1), None);
+        // A new chunk restarts at zero, independent of the old cursor.
+        assert_eq!(texture_upload_range(0, 1), Some((0, 1)));
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -398,6 +586,22 @@ const STAMPS: u32 = 4096;
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
+
+// The first owning reference is retained, not replaced by later calls.
+fn retain_once<T>(objects: &mut std::collections::HashMap<usize, T>, identity: usize, object: T) {
+    objects.entry(identity).or_insert(object);
+}
+
+// Keep one owner per shadow identity for every deferred step on this list.
+// The retained Arc prevents its allocation address from being reused.
+fn retain_shadow<T>(
+    owners: &mut std::collections::HashMap<usize, std::sync::Arc<T>>,
+    shadow: &std::sync::Arc<T>,
+) -> usize {
+    let key = std::sync::Arc::as_ptr(shadow) as usize;
+    owners.entry(key).or_insert_with(|| shadow.clone());
+    key
+}
 
 type States = std::collections::HashMap<
     usize,
@@ -467,6 +671,30 @@ unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
 
+// Pool only small placed-footprint copies; large copies retain their
+// dedicated allocation. Separate from vertex scratch to preserve alignment.
+const TEXTURE_UPLOAD_CHUNK: u64 = 1 << 20;
+const SMALL_TEXTURE_UPLOAD: u64 = 256 << 10;
+const TEXTURE_UPLOAD_ALIGNMENT: u64 = 512;
+
+fn texture_upload_range(used: u64, size: u64) -> Option<(u64, u64)> {
+    if size == 0 || size > SMALL_TEXTURE_UPLOAD {
+        return None;
+    }
+    let offset = used.checked_add(TEXTURE_UPLOAD_ALIGNMENT - 1)?
+        & !(TEXTURE_UPLOAD_ALIGNMENT - 1);
+    let end = offset.checked_add(size)?;
+    (end <= TEXTURE_UPLOAD_CHUNK).then_some((offset, end))
+}
+
+// Keep at most one chunk from an active recording. A recording that
+// did not use it leaves its cursor at zero and releases it at reset.
+fn reset_texture_upload<T>(chunk: Option<(T, usize, u64)>) -> Option<(T, usize, u64)> {
+    chunk
+        .filter(|(_, _, used)| *used != 0)
+        .map(|(buffer, data, _)| (buffer, data, 0))
+}
+
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
@@ -477,13 +705,13 @@ enum Step {
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
-    Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    Refresh(usize, usize, usize),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    GpuWrite(usize, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -497,10 +725,16 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Current small texture-copy upload chunk: resource, mapping, cursor.
+    /// Older chunks remain in uploads until reset. One active chunk may
+    /// be reused by the next recording after a completed reset.
+    texture_upload: Option<(ID3D12Resource, usize, u64)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
-    kept: Vec<windows::core::IUnknown>,
+    kept: std::collections::HashMap<usize, windows::core::IUnknown>,
+    /// Owners named by Refresh and GpuWrite steps, until reset.
+    shadows: std::collections::HashMap<usize, std::sync::Arc<crate::shadow::Shadow>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -593,8 +827,25 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        #[cfg(feature = "diagnostics")]
+        let queued = std::time::Instant::now();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let wait_us = (started - queued).as_micros() as u64;
+        // An empty host submission has no deferred work or completion
+        // writes. Retain the serialization boundary, but avoid submitting
+        // an empty D3D list array and signalling/waiting on a new fence.
+        if runs.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            SCHEDULE.lock().unwrap_or_else(|e| e.into_inner()).record(0, 0, wait_us);
+            // SAFETY: a plain query; preserve device-removal reporting.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                fail(format_args!("host GPU device removed before an empty submission{}", self.removal_data(runs)));
+            }
+            self.log_messages();
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
@@ -624,6 +875,8 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        #[cfg(feature = "diagnostics")]
+        SCHEDULE.lock().unwrap_or_else(|e| e.into_inner()).record(runs.len(), groups.len(), wait_us);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -694,13 +947,15 @@ impl Host {
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
+            let deferred = list.deferred();
+            for step in &deferred.copies {
+                if let Step::GpuWrite(key, address, len) = step {
+                    let shadow = &deferred.shadows[key];
+                    if !back.iter().any(|(s, a, l)| {
+                        std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
+                    }) {
+                        back.push((shadow.clone(), *address, *len));
+                    }
                 }
             }
         }
@@ -992,7 +1247,6 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -1006,6 +1260,14 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        let mut deferred = self.deferred();
+        let texture_upload = reset_texture_upload(deferred.texture_upload.take());
+        *deferred = Deferred {
+            texture_upload,
+            ..Deferred::default()
+        };
+        // Avoid holding the deferred lock while acquiring the scratch lock.
+        drop(deferred);
         // The old recording no longer names these upload allocations.
         self.scratch.lock().unwrap_or_else(|e| e.into_inner()).reset_recording();
     }
@@ -1151,9 +1413,8 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
-            deferred
-                .copies
-                .push(Step::Refresh(shadow.clone(), address, len));
+            let owner = retain_shadow(&mut deferred.shadows, shadow);
+            deferred.copies.push(Step::Refresh(owner, address, len));
         }
     }
 
@@ -1165,9 +1426,9 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let owner = retain_shadow(&mut deferred.shadows, shadow);
+        deferred.copies.push(Step::GpuWrite(owner, address, len));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -1184,6 +1445,41 @@ impl HostList {
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
+    }
+
+    /// Allocate a placed-footprint region. A recorded copy retains its
+    /// resource and offset until reset; the submission-time fill touches
+    /// only its own bytes, including when the list is submitted again.
+    pub(crate) fn texture_upload(
+        &self,
+        host: &Host,
+        size: u64,
+    ) -> Option<(ID3D12Resource, *mut u8, u64)> {
+        if size == 0 {
+            return None;
+        }
+        if size > SMALL_TEXTURE_UPLOAD {
+            return self.upload(host, size).map(|(b, p)| (b, p, 0));
+        }
+        let mut deferred = self.deferred();
+        let fits = deferred.texture_upload.as_ref()
+            .and_then(|(_, _, used)| texture_upload_range(*used, size));
+        if fits.is_none() {
+            let (buffer, data) = host.upload_buffer(TEXTURE_UPLOAD_CHUNK)?;
+            name(&buffer, || "list texture upload chunk".into());
+            if let Some((previous, _, _)) =
+                deferred.texture_upload.replace((buffer, data as usize, 0))
+            {
+                // Earlier recorded copies still name the old chunk.
+                deferred.uploads.push(previous);
+            }
+        }
+        let (buffer, data, used) = deferred.texture_upload.as_mut()?;
+        let (offset, end) = texture_upload_range(*used, size)?;
+        *used = end;
+        // SAFETY: the region lies in a retained, persistently mapped chunk.
+        let at = unsafe { (*data as *mut u8).add(offset as usize) };
+        Some((buffer.clone(), at, offset))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
@@ -1240,10 +1536,12 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
-    /// Keeps `object` alive until the list is reset.
+    /// Keeps one owning reference per COM identity until the list is
+    /// reset. The retained IUnknown prevents identity-address reuse.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+            let identity = object.as_raw() as usize;
+            retain_once(&mut self.deferred().kept, identity, object);
         }
     }
 
@@ -1277,7 +1575,8 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let deferred = self.deferred();
+        for step in &deferred.copies {
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -1299,13 +1598,13 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
-                Step::Refresh(shadow, address, len) => {
+                Step::Refresh(key, address, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
-                    batch.add(shadow, *address, *len);
+                    batch.add(&deferred.shadows[key], *address, *len);
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
@@ -1320,10 +1619,10 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(key, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
-                    shadow.writing(*address, *len);
+                    deferred.shadows[key].writing(*address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -1704,6 +2003,19 @@ impl Meter {
             || self.logged.elapsed() >= std::time::Duration::from_secs(5)
         {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            {
+                let sample = std::mem::take(&mut *SCHEDULE.lock().unwrap_or_else(|e| e.into_inner()));
+                tracing::info!(
+                    calls = sample.calls,
+                    empty = sample.empty,
+                    title_lists = sample.lists,
+                    gpu_groups = sample.groups,
+                    total_lock_wait_us = sample.wait_us,
+                    max_lock_wait_us = sample.max_wait_us,
+                    "submission scheduling sample (caller wait, not GPU time)"
+                );
+            }
             tracing::info!(
                 sample_frames = frames as u32,
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
@@ -1716,6 +2028,10 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                crate::shader_cache::log_profile();
+                if let Some(adapter) = host().and_then(|h| h.budget_adapter.as_ref()) {
+                    log_memory_budget(adapter);
+                }
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -2162,6 +2478,22 @@ fn pump() {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    #[test]
+    fn scheduling_sample_counts_empty_and_grouped_submissions() {
+        let mut sample = super::ScheduleSample::default();
+        sample.record(0, 0, 12);
+        sample.record(4, 1, 20);
+        sample.record(3, 3, 5);
+        let observed = std::mem::take(&mut sample);
+        assert_eq!(observed.calls, 3);
+        assert_eq!(observed.empty, 1);
+        assert_eq!(observed.lists, 7);
+        assert_eq!(observed.groups, 4);
+        assert_eq!(observed.wait_us, 37);
+        assert_eq!(observed.max_wait_us, 20);
+        assert_eq!(sample, super::ScheduleSample::default());
+    }
 
     #[test]
     fn indexed_refreshes_match_ordered_linear_coalescing() {

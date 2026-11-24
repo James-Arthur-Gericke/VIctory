@@ -31,6 +31,15 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
+/// A signalled event is not sufficient on its own: D3D12 reports device
+/// removal as UINT64_MAX from GetCompletedValue. Do not publish GPU writes
+/// or reuse submission memory unless completion was actually observed.
+fn submission_completed(wait: u32, completed: u64, expected: u64) -> bool {
+    wait == windows::Win32::Foundation::WAIT_OBJECT_0.0
+        && completed != u64::MAX
+        && completed >= expected
+}
+
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
@@ -251,6 +260,17 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submission_completion_requires_a_valid_wait_and_fence() {
+        use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        assert!(submission_completed(WAIT_OBJECT_0.0, 8, 8));
+        assert!(submission_completed(WAIT_OBJECT_0.0, 9, 8));
+        assert!(!submission_completed(WAIT_OBJECT_0.0, 7, 8));
+        assert!(!submission_completed(WAIT_OBJECT_0.0, u64::MAX, 8));
+        assert!(!submission_completed(WAIT_FAILED.0, 8, 8));
+        assert!(!submission_completed(WAIT_TIMEOUT.0, 8, 8));
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -534,11 +554,23 @@ impl Host {
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                let wait = match waited {
+                    Ok(()) => WaitForSingleObject(self.event, INFINITE),
+                    Err(e) => fail(format_args!(
+                        "host submission fence setup failed ({e}){}{}",
+                        self.removal_data(runs),
+                        last_notes(runs)
+                    )),
+                };
+                let completed = self.fence.GetCompletedValue();
+                if !submission_completed(wait.0, completed, *submitted) {
+                    fail(format_args!(
+                        "host submission completion not confirmed (wait {:#x}, completed {completed:#x}, expected {:#x}){}{}",
+                        wait.0,
+                        *submitted,
+                        self.removal_data(runs),
+                        last_notes(runs)
+                    ));
                 }
             }
             #[cfg(feature = "diagnostics")]

@@ -60,7 +60,7 @@ fn library() -> Option<&'static Mutex<Library>> {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR
                 .get()
-                .and_then(|d| std::fs::read(d.join(LIBRARY_FILE)).ok())
+                .and_then(|d| crate::io_profile::read(crate::io_profile::Phase::PipelineCacheRead, d.join(LIBRARY_FILE)).ok())
                 .unwrap_or_default();
             let library = open(&device, blob);
             if library.is_none() {
@@ -246,7 +246,11 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     if used.is_none() {
         let listed = DIR
             .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
+            .and_then(|d| crate::io_profile::measure(
+                crate::io_profile::Phase::PipelineCacheRead, 0,
+                || std::fs::read_to_string(d.join(EARLY_FILE)),
+                |r| (r.as_ref().map_or(0, |s| s.len() as u64), r.is_ok()),
+            ).ok())
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");

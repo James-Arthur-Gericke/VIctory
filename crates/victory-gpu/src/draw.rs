@@ -64,6 +64,9 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// Missing attachments must not compact the title's output slots.
+    requested_targets: usize,
+    depth_requested: bool,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -256,10 +259,13 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        self.requested_targets = handles.len();
+        self.depth_requested = depth != 0;
+        self.targets.clear();
+        self.depth = 0;
         let Some(host) = crate::host::host() else {
             return;
         };
-        self.targets.clear();
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -277,14 +283,28 @@ impl State {
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
-        self.depth = 0;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        let mut dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
+        // Do not bind a compacted subset: SV_TargetN would address a
+        // different texture, and the pipeline's attachment formats may not
+        // match. Until null/missing views can be represented, refuse draws
+        // against this incomplete binding. A later complete bind recovers.
+        if !self.attachments_complete() {
+            once!(
+                requested = self.requested_targets,
+                found = self.targets.len(),
+                depth_requested = self.depth_requested,
+                depth_found = self.depth != 0,
+                "incomplete render-target binding; graphics draws will be dropped"
+            );
+            rtvs.clear();
+            dsv = None;
+        }
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -294,6 +314,12 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+    }
+
+    /// Whether every requested output slot has a host resource. No
+    /// attachments is valid for a graphics pipeline that needs none.
+    fn attachments_complete(&self) -> bool {
+        self.targets.len() == self.requested_targets && (!self.depth_requested || self.depth != 0)
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -341,6 +367,9 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        if !self.attachments_complete() {
+            return false;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -1214,4 +1243,33 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::State;
+
+    #[test]
+    fn graphics_attachments_require_every_requested_slot() {
+        let mut s = State::default();
+        assert!(s.attachments_complete());
+
+        s.requested_targets = 3;
+        s.targets.extend([1, 3]);
+        assert!(!s.attachments_complete());
+        s.targets.insert(1, 2);
+        assert!(s.attachments_complete());
+
+        s.depth_requested = true;
+        assert!(!s.attachments_complete());
+        s.depth = 4;
+        assert!(s.attachments_complete());
+
+        s.reset(std::ptr::null());
+        assert!(s.attachments_complete());
+        s.depth_requested = true;
+        assert!(!s.attachments_complete());
+        s.depth = 5;
+        assert!(s.attachments_complete()); // depth-only pass
+    }
 }

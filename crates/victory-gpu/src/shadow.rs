@@ -214,15 +214,7 @@ impl Shadow {
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
+                    if merge_sparse_copy_back(title, host, old) {
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
@@ -365,6 +357,43 @@ impl Shadow {
     }
 }
 
+/// Preserve the original three-way merge: GPU-changed bytes win, all
+/// other bytes come from the title. Avoid redundant writes to the
+/// GPU-visible mapped buffer for equal chunks and GPU-only changes.
+/// Mixed chunks keep the byte-level rule. The chunk is a software
+/// granularity, not an assumption about the GPU's cache-line size.
+fn merge_sparse_copy_back(title: &mut [u8], host: &mut [u8], before: &[u8]) -> bool {
+    debug_assert_eq!(title.len(), host.len());
+    debug_assert_eq!(title.len(), before.len());
+    const CHUNK: usize = 64;
+    let mut changed = false;
+    for ((t, h), old) in title.chunks_mut(CHUNK).zip(host.chunks_mut(CHUNK)).zip(before.chunks(CHUNK)) {
+        if t == h {
+            continue;
+        }
+        if h == old {
+            // No GPU changes in this chunk. Only the host copy is stale.
+            h.copy_from_slice(t);
+        } else if t == old {
+            // Only the GPU changed. The host copy already has the result.
+            t.copy_from_slice(h);
+            changed = true;
+        } else {
+            for ((t, h), o) in t.iter_mut().zip(h.iter_mut()).zip(old) {
+                if *h != *o {
+                    if *t != *h {
+                        *t = *h;
+                        changed = true;
+                    }
+                } else if *h != *t {
+                    *h = *t;
+                }
+            }
+        }
+    }
+    changed
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -496,4 +525,63 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_sparse_copy_back;
+
+    fn check(before: &[u8], title: &[u8], host: &[u8]) {
+        let (mut expected_title, mut expected_host) = (title.to_vec(), host.to_vec());
+        let mut changed = false;
+        for ((t, h), o) in expected_title.iter_mut().zip(&mut expected_host).zip(before) {
+            if *h != *o && *t != *h {
+                *t = *h;
+                changed = true;
+            }
+            *h = *t;
+        }
+        let (mut title, mut host) = (title.to_vec(), host.to_vec());
+        assert_eq!(merge_sparse_copy_back(&mut title, &mut host, before), changed);
+        assert_eq!(title, expected_title);
+        assert_eq!(host, expected_host);
+    }
+
+    #[test]
+    fn sparse_copy_back_matches_original_merge_across_chunks() {
+        // Equal, CPU-only, GPU-only, mixed and partial trailing chunks.
+        let before = vec![5; 4 * 64 + 13];
+        let mut title = before.clone();
+        let mut host = before.clone();
+        title[..64].fill(9);
+        host[..64].fill(9);
+        title[64..128].fill(8);
+        host[128..192].fill(7);
+        title[192] = 6;
+        host[192] = 10;
+        title[193] = 11;
+        host[194] = 12;
+        host[256] = 13;
+        title[268] = 14;
+        check(&before, &title, &host);
+        for n in [0, 1, 63, 64, 65, 127, 128, 129, before.len()] {
+            check(&before[..n], &title[..n], &host[..n]);
+            check(&before[..n], &title[..n], &before[..n]);
+            check(&before[..n], &before[..n], &host[..n]);
+            check(&before[..n], &host[..n], &host[..n]);
+        }
+
+        // Exercise every combination of representative byte values.
+        let (mut old, mut cpu, mut gpu) = (Vec::new(), Vec::new(), Vec::new());
+        for a in [0, 1, 127, 255] {
+            for b in [0, 1, 127, 255] {
+                for c in [0, 1, 127, 255] {
+                    old.push(a);
+                    cpu.push(b);
+                    gpu.push(c);
+                }
+            }
+        }
+        check(&old, &cpu, &gpu);
+    }
 }

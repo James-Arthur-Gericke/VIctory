@@ -1,0 +1,9 @@
+# CPU hardware diagnostics (V3.1 workflow 1)
+
+Windows PowerShell 7+, external read-only collector; no title execution or changes to runtime scheduling. Start the intended local VIctory process yourself and supply its exact PID. From the repository root:
+
+    ./tools/diagnostics/Collect-Cpu.ps1 -ProcessId 1234 -Samples 60 -IntervalMs 1000 > C:\Benchmarks\cpu.jsonl
+
+Use a directory outside the repository. Optional -PerLogicalProcessor queries Windows formatted processor counters, which are machine-wide logical-processor busy readings (not process-specific, and not physical core counters); the query adds overhead. The default does not query these each sample. Samples have UTC and monotonic elapsed milliseconds, process CPU time, logical-CPU-equivalent percent (can exceed 100), machine-normalized percent, topology summary, thread count, and bounded per-thread deltas. Thread identity includes start time, so recycled IDs or unavailable times do not fabricate utilization. First sample, unavailable/reset counters and unsupported sensors are null. Sampling is approximate, not an atomic snapshot; short-lived threads can disappear. Process exit/access errors can end a capture; do not treat a partial capture as a full window.
+
+Processor group counts come from Windows native APIs; physical core totals are optional CIM socket totals. This collector does not infer CCDs or cache residency. No portable CPU temperature, clock, power or cache-miss readings are implemented; those fields are null pending a supported external collector. The script adds CPU overhead and should be used with identical settings in matched A/B tests. This is telemetry, not an optimization or CPU performance certification. Do not commit raw logs. Run synthetic and local-process smoke checks with tools/diagnostics/test-cpu-metrics.ps1.

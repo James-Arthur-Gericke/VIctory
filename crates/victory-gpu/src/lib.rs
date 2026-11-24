@@ -31,6 +31,8 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+pub mod io_profile;
 pub mod list;
 pub mod object;
 pub mod pipeline;

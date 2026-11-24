@@ -85,6 +85,18 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Synthetic upload/default/readback benchmark; verified WARP by default.
+    TransferBenchmark {
+        /// Explicit DXGI adapter index for supervised physical hardware testing.
+        #[arg(long)]
+        adapter: Option<u32>,
+        /// Bytes per region (four regions, 512-byte aligned).
+        #[arg(long, default_value_t = 262144)]
+        region_bytes: usize,
+        /// Repeated pairs of dedicated and pooled uploads.
+        #[arg(long, default_value_t = 3)]
+        repeats: u32,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -153,6 +165,12 @@ fn main() -> Result<()> {
             list,
             jobs,
         } => translate::run(paths, validate, pipelines, list, jobs),
+        Command::TransferBenchmark { adapter, region_bytes, repeats } => {
+            #[cfg(windows)]
+            { victory_shader::emit::host::transfer::run(adapter, region_bytes, repeats).map_err(anyhow::Error::msg) }
+            #[cfg(not(windows))]
+            { let _ = (adapter, region_bytes, repeats); anyhow::bail!("transfer benchmark requires Windows") }
+        }
         Command::Run {
             exe,
             unimplemented,

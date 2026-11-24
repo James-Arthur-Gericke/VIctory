@@ -42,6 +42,29 @@ jobs:
       - name: Diagnostic log comparator tests
         shell: bash
         run: sh tools/diagnostics/test-compare-logs.sh
+      - name: CPU telemetry tests
+        shell: pwsh
+        run: ./tools/diagnostics/test-cpu-metrics.ps1
+      - name: CPU thread scaling tests
+        shell: pwsh
+        run: ./tools/benchmark/test-cpu-scaling-metrics.ps1
+      - name: System RAM telemetry tests
+        shell: pwsh
+        run: ./tools/diagnostics/test-ram-metrics.ps1
+      - name: Synthetic transfer CLI smoke (WARP only)
+        run: cargo run --locked -p victory -- transfer-benchmark --region-bytes 4096 --repeats 1
+      - name: Storage profiling tests
+        shell: pwsh
+        run: ./tools/benchmark/test-storage-metrics.ps1
+      - name: Combined hardware report tests
+        shell: pwsh
+        run: ./tools/diagnostics/test-hardware-report.ps1
+      - name: Hardware regression gate tests
+        shell: pwsh
+        run: ./tools/benchmark/test-hardware-regression.ps1
+      - name: Combined report-to-regression integration smoke
+        shell: pwsh
+        run: ./tools/benchmark/test-hardware-integration.ps1
 
   hardware-build:
     # Hosted build only: never run a title or access a physical test PC.

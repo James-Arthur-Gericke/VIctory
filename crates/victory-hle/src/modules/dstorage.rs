@@ -786,6 +786,15 @@ extern "system" fn close(this: QueueRef) {
 
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
+    victory_gpu::io_profile::measure(
+        victory_gpu::io_profile::Phase::StorageRequest,
+        u64::from(request.source_size),
+        || execute_request(request),
+        |r| (if r.is_ok() { u64::from(request.source_size) } else { 0 }, r.is_ok()),
+    )
+}
+
+fn execute_request(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -829,9 +838,17 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
+        Some(tables) => {
+            let len = out.len() as u64;
+            victory_gpu::io_profile::measure(
+                victory_gpu::io_profile::Phase::Bcpack,
+                len,
+                || bcpack::decode(bc, &source, out, tables),
+                |r| (if r.is_ok() { len } else { 0 }, r.is_ok()),
+            )
             .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            .map_err(|e| fail(INVALID_DATA, &e.to_string()))
+        }
         None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
@@ -847,11 +864,16 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
-        .map_err(|status| {
-            tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
-        })
+    victory_gpu::io_profile::measure(
+        victory_gpu::io_profile::Phase::Zlib,
+        out.len() as u64,
+        || miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false),
+        |r| (r.as_ref().copied().unwrap_or(0) as u64, r.is_ok()),
+    )
+    .map_err(|status| {
+        tracing::debug!(?status, "dstorage: zlib stream");
+        INVALID_DATA
+    })
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -923,6 +945,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         .state
         .file;
     let started = std::time::Instant::now();
+    let io_started = victory_gpu::io_profile::start();
     let mut done = 0;
     let result = loop {
         if done == out.len() {
@@ -935,6 +958,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    victory_gpu::io_profile::finish(io_started, victory_gpu::io_profile::Phase::StorageFileRead, out.len() as u64, done as u64, result.is_ok());
     result
 }
 

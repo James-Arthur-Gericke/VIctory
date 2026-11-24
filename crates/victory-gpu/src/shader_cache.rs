@@ -216,7 +216,14 @@ fn cached(
         ).map_err(|e| format!("{e:#}"))?;
         if let Some(shader) = profile(
             ProfilePhase::ReadDecode,
-            || std::fs::read(&path).ok().and_then(|b| decode(&b)),
+            || crate::io_profile::read(crate::io_profile::Phase::ShaderCacheRead, &path).ok().and_then(|b| {
+                let len = b.len() as u64;
+                crate::io_profile::measure(
+                    crate::io_profile::Phase::ShaderCacheDecode, len,
+                    || decode(&b),
+                    |r| (if r.is_some() { len } else { 0 }, r.is_some()),
+                )
+            }),
             Option::is_some,
         ) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {

@@ -34,12 +34,59 @@ $files = foreach ($profile in @('release', 'diag')) {
     }
 }
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $output
+# Allowlist only source-controlled local benchmark helpers and guides.
+$bundlePaths = @(
+    'docs/asset-policy.md'
+    'docs/asset-streaming-io-profiling.md'
+    'docs/combined-hardware-report.md'
+    'docs/cpu-hardware-diagnostics.md'
+    'docs/cpu-thread-scaling.md'
+    'docs/hardware-benchmark.md'
+    'docs/hardware-regression-gate.md'
+    'docs/hardware-validation-build.md'
+    'docs/nvme-storage-profiling.md'
+    'docs/performance-regression.md'
+    'docs/ram-vram-transfer-benchmark.md'
+    'docs/system-ram-profiling.md'
+    'docs/v3-1-development-roadmap.md'
+    'tools/benchmark/Compare-Presents.ps1'
+    'tools/benchmark/CpuScaling.ps1'
+    'tools/benchmark/HardwareRegressionMetrics.ps1'
+    'tools/benchmark/Invoke-CpuScalingWorker.ps1'
+    'tools/benchmark/PresentMetrics.ps1'
+    'tools/benchmark/RegressionMetrics.ps1'
+    'tools/benchmark/Test-CpuScaling.ps1'
+    'tools/benchmark/Test-HardwareRegression.ps1'
+    'tools/benchmark/Test-PresentRegression.ps1'
+    'tools/benchmark/Test-StorageReads.ps1'
+    'tools/diagnostics/Collect-Cpu.ps1'
+    'tools/diagnostics/Collect-Ram.ps1'
+    'tools/diagnostics/Collect-Storage.ps1'
+    'tools/diagnostics/Compare-RamCycles.ps1'
+    'tools/diagnostics/CpuMetrics.ps1'
+    'tools/diagnostics/HardwareReportMetrics.ps1'
+    'tools/diagnostics/New-HardwareReport.ps1'
+    'tools/diagnostics/README.md'
+    'tools/diagnostics/RamMetrics.ps1'
+    'tools/diagnostics/StorageMetrics.ps1'
+    'tools/diagnostics/compare-logs.sh'
+)
+$bundle = foreach ($relative in $bundlePaths) {
+    $source = Join-Path $root $relative
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing package helper: $relative" }
+    $dest = Join-Path $output $relative
+    New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
+    Copy-Item -LiteralPath $source -Destination $dest
+    [pscustomobject]@{file=$relative;sha256=(Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $dest).Length}
+}
+
 [pscustomobject]@{
     sourceCommit = $commit
     source = "https://github.com/James-Arthur-Gericke/VIctory/tree/$commit"
     rustc = $rust
     target = 'Windows x64 (host)'
     files = @($files)
+    helpers = @($bundle)
     validation = 'CLI help/version smoke only; no title or GPU validation'
 } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $output 'build-manifest.json') -Encoding utf8
 Write-Host 'Experimental hardware build package created.'

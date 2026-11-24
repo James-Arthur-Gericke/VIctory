@@ -1,6 +1,8 @@
 //! Host D3D12 checks for emitted shaders: pipeline creation and, for
 //! tests, drawing a full-screen triangle and reading the target back.
 
+pub mod transfer;
+
 use std::ffi::CString;
 
 use windows::Win32::Graphics::Direct3D::*;

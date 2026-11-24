@@ -33,3 +33,7 @@ not report while frames are stalled. See tools/diagnostics/README.md for the
 frame-weighted log comparator.
 
 A passing CI build is not evidence of playable rendering or improved FPS.
+
+## V3.1 package
+
+Integration V3.1 includes the V3 baseline and the eight hardware diagnostic workflows. The artifact contains both executables plus an explicit allowlist of benchmark/diagnostic scripts and guides under tools/ and docs/, with SHA256 and sizes in the manifest's helpers array. Preserve relative directories when extracting. Verify source commit and hashes before execution. No capture, cache, configuration, game or proprietary derived data is packaged. Start with synthetic CPU and WARP transfer checks, then supervised physical tests only. The combined report uses local captures and optional normalized external GPU telemetry; no vendor sensor collection is included. V3 lacks the new transfer CLI, so omit transfer regression thresholds when comparing unmodified V3 to V3.1. Compare shared observable metrics and identical capture conditions. See docs/v3-1-development-roadmap.md and docs/combined-hardware-report.md. CI does not certify physical hardware or rendering.

@@ -235,9 +235,7 @@ fn create() -> windows::core::Result<Host> {
 /// Resolve the adapter by the device's LUID, not by enumeration order.
 #[cfg(feature = "diagnostics")]
 fn budget_adapter(device: &ID3D12Device) -> Option<IDXGIAdapter3> {
-    if std::env::var_os("VICTORY_GPU_RESIDENCY").is_none() {
-        return None;
-    }
+    std::env::var_os("VICTORY_GPU_RESIDENCY")?;
     // SAFETY: plain queries on a live device and factory.
     let result = unsafe {
         CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))

@@ -1229,6 +1229,45 @@ impl HostList {
     }
 }
 
+/// Pending ranges indexed by the identity of their retained Arc. Keep
+/// first-seen order for the actual refreshes; the index only speeds up
+/// range coalescing and is cleared at each flush.
+struct Refreshes<T> {
+    ranges: Vec<(std::sync::Arc<T>, usize, usize)>,
+    index: std::collections::HashMap<usize, usize>,
+}
+
+impl<T> Default for Refreshes<T> {
+    fn default() -> Self {
+        Self {
+            ranges: Vec::new(),
+            index: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<T> Refreshes<T> {
+    fn add(&mut self, copy: &std::sync::Arc<T>, address: usize, len: usize) {
+        let end = address + len;
+        let key = std::sync::Arc::as_ptr(copy) as usize;
+        match self.index.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let (_, from, to) = &mut self.ranges[*entry.get()];
+                (*from, *to) = ((*from).min(address), (*to).max(end));
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(self.ranges.len());
+                self.ranges.push((copy.clone(), address, end));
+            }
+        }
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = (std::sync::Arc<T>, usize, usize)> + '_ {
+        self.index.clear();
+        self.ranges.drain(..)
+    }
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -1239,22 +1278,14 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Refreshes<crate::shadow::Shadow>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
-        match self
-            .refreshes
-            .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
-        }
+        self.refreshes.add(shadow, address, len);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -1271,7 +1302,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        for (shadow, from, to) in self.refreshes.drain() {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
@@ -1984,6 +2015,38 @@ fn pump() {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    #[test]
+    fn indexed_refreshes_match_ordered_linear_coalescing() {
+        let copies: Vec<_> = (0..64).map(|_| Arc::new(7u32)).collect();
+        let mut pending = super::Refreshes::default();
+        let mut reference: Vec<(Arc<u32>, usize, usize)> = Vec::new();
+        for i in 0..2048 {
+            let copy = &copies[(i * 17) % copies.len()];
+            let start = (i * 31) % 4096;
+            let len = i % 129;
+            pending.add(copy, start, len);
+            if let Some((_, from, to)) =
+                reference.iter_mut().find(|(s, ..)| Arc::ptr_eq(s, copy))
+            {
+                *from = (*from).min(start);
+                *to = (*to).max(start + len);
+            } else {
+                reference.push((copy.clone(), start, start + len));
+            }
+        }
+        let got: Vec<_> = pending.drain().collect();
+        assert_eq!(got.len(), reference.len());
+        for ((a, from, to), (b, want_from, want_to)) in got.iter().zip(&reference) {
+            assert!(Arc::ptr_eq(a, b));
+            assert_eq!((*from, *to), (*want_from, *want_to));
+        }
+        assert!(pending.drain().next().is_none());
+        pending.add(&copies[0], 10, 4);
+        let next: Vec<_> = pending.drain().collect();
+        assert_eq!(next.len(), 1);
+        assert_eq!((next[0].1, next[0].2), (10, 14));
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {

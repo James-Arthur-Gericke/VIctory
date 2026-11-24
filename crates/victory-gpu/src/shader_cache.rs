@@ -236,10 +236,23 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let stage = *STAGES.get(r.word()? as usize)?;
     let dxil = r.list()?;
     let n = r.word()? as usize;
-    let mut user_data = Vec::with_capacity(n.min(256));
+    // The host binds user data as D3D12 root constants (at most 64
+    // DWORDs in an entire root signature). Reject corrupt cache metadata
+    // before user_data_dwords rounds the index or the host uses it.
+    if n > 64 {
+        return None;
+    }
+    let mut user_data = Vec::with_capacity(n);
+    let mut seen = 0u64;
     for _ in 0..n {
+        let index = r.word()?;
+        let bit = 1u64.checked_shl(index)?;
+        if seen & bit != 0 {
+            return None;
+        }
+        seen |= bit;
         user_data.push(UserData {
-            index: r.word()?,
+            index,
             slot: u8::try_from(r.word()?).ok()?,
             root: root_type(r.word()?),
             dword: r.word()?,
@@ -346,6 +359,57 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn rejects_out_of_range_or_duplicate_cached_user_data() {
+        let mut s = shader();
+        s.user_data[0].index = 63;
+        assert_eq!(decode(&encode(&s)), Some(s.clone()));
+        for index in [64, u32::MAX - 1, u32::MAX] {
+            s.user_data[0].index = index;
+            assert_eq!(decode(&encode(&s)), None);
+        }
+        s.user_data[0].index = 0;
+        s.user_data.push(s.user_data[0]);
+        assert_eq!(decode(&encode(&s)), None);
+
+        s.user_data = (0..64)
+            .map(|index| UserData {
+                index,
+                ..s.user_data[0]
+            })
+            .collect();
+        assert_eq!(decode(&encode(&s)), Some(s.clone()));
+        s.user_data.push(s.user_data[0]);
+        assert_eq!(decode(&encode(&s)), None);
+    }
+
+    #[test]
+    fn invalid_cached_index_is_retranslated() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [9u8; 32];
+        let container = b"synthetic container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        let mut invalid = shader();
+        invalid.user_data[0].index = u32::MAX;
+        let files = walk(dir.path());
+        assert!(!files.is_empty());
+        for path in files {
+            std::fs::write(path, encode(&invalid)).unwrap();
+        }
+
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
     }
 
     #[test]

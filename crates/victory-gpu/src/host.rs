@@ -31,6 +31,15 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
+/// A signalled event is not sufficient on its own: D3D12 reports device
+/// removal as UINT64_MAX from GetCompletedValue. Do not publish GPU writes
+/// or reuse submission memory unless completion was actually observed.
+fn submission_completed(wait: u32, completed: u64, expected: u64) -> bool {
+    wait == windows::Win32::Foundation::WAIT_OBJECT_0.0
+        && completed != u64::MAX
+        && completed >= expected
+}
+
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
@@ -250,7 +259,57 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallback_counts_reads_and_zeroes_only_failed_pages() {
+        let mut reads = Vec::new();
+        let mut zeroed = Vec::new();
+        let start = 60 << 10;
+        let stats = super::fallback_pieces(
+            start,
+            12 << 10,
+            |at, n| {
+                reads.push((at, n));
+                at != 64 << 10
+            },
+            |at, n| zeroed.push((at, n)),
+        );
+        assert_eq!(
+            reads,
+            vec![
+                (60 << 10, 4 << 10),
+                (64 << 10, 8 << 10),
+                (64 << 10, 4 << 10),
+                (68 << 10, 4 << 10),
+            ]
+        );
+        assert_eq!(zeroed, vec![(64 << 10, 4 << 10)]);
+        assert_eq!(stats, (4, 4096));
+    }
+
+    #[test]
+    fn fallback_keeps_unaligned_edges_and_empty_ranges() {
+        let mut zeroed = Vec::new();
+        let stats = super::fallback_pieces(4095, 2, |_, _| false, |a, n| zeroed.push((a, n)));
+        assert_eq!(zeroed, vec![(4095, 1), (4096, 1)]);
+        assert_eq!(stats, (3, 2));
+        assert_eq!(
+            super::fallback_pieces(4095, 0, |_, _| panic!("read"), |_, _| panic!("zero")),
+            (0, 0)
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn submission_completion_requires_a_valid_wait_and_fence() {
+        use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        assert!(submission_completed(WAIT_OBJECT_0.0, 8, 8));
+        assert!(submission_completed(WAIT_OBJECT_0.0, 9, 8));
+        assert!(!submission_completed(WAIT_OBJECT_0.0, 7, 8));
+        assert!(!submission_completed(WAIT_OBJECT_0.0, u64::MAX, 8));
+        assert!(!submission_completed(WAIT_FAILED.0, 8, 8));
+        assert!(!submission_completed(WAIT_TIMEOUT.0, 8, 8));
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -534,11 +593,23 @@ impl Host {
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                let wait = match waited {
+                    Ok(()) => WaitForSingleObject(self.event, INFINITE),
+                    Err(e) => fail(format_args!(
+                        "host submission fence setup failed ({e}){}{}",
+                        self.removal_data(runs),
+                        last_notes(runs)
+                    )),
+                };
+                let completed = self.fence.GetCompletedValue();
+                if !submission_completed(wait.0, completed, *submitted) {
+                    fail(format_args!(
+                        "host submission completion not confirmed (wait {:#x}, completed {completed:#x}, expected {:#x}){}{}",
+                        wait.0,
+                        *submitted,
+                        self.removal_data(runs),
+                        last_notes(runs)
+                    ));
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1320,22 +1391,53 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+    #[cfg(feature = "diagnostics")]
+    let fallback_started = std::time::Instant::now();
+    let (reads, unmapped) = fallback_pieces(
+        src as usize,
+        len,
+        |at, n| read(at as *const u8, dst.wrapping_add(at - src as usize), n),
+        |at, n| {
+            let to = dst.wrapping_add(at - src as usize);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to.write_bytes(0, n) };
+        },
+    );
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::FallbackReads, reads);
+        add(C::Unmapped, unmapped);
+        add(C::FallbackUs, fallback_started.elapsed().as_micros() as u64);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (reads, unmapped);
+}
+
+/// Retry a failed bulk read in 64 KiB pieces, then 4 KiB pages. Returns
+/// the number of retry reads (excluding the initial bulk read) and the
+/// number of bytes zeroed. The callbacks keep this policy testable without
+/// title memory or a graphics device.
+fn fallback_pieces(
+    start: usize,
+    len: usize,
+    mut read_piece: impl FnMut(usize, usize) -> bool,
+    mut zero: impl FnMut(usize, usize),
+) -> (u64, u64) {
+    let (mut reads, mut unmapped) = (0, 0);
+    for_pieces(start, len, 64 << 10, |at, n| {
+        reads += 1;
+        if !read_piece(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                reads += 1;
+                if !read_piece(at, n) {
+                    zero(at, n);
+                    unmapped += n as u64;
                 }
             });
         }
     });
+    (reads, unmapped)
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -1525,9 +1627,15 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+        // Diagnostics must report each drained sample: otherwise four of
+        // five one-second windows (including per-shader drops) disappear.
+        // Keep the ordinary release log cadence unchanged.
+        if cfg!(feature = "diagnostics")
+            || self.logged.elapsed() >= std::time::Duration::from_secs(5)
+        {
             self.logged = std::time::Instant::now();
             tracing::info!(
+                sample_frames = frames as u32,
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \

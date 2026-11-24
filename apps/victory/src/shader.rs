@@ -42,12 +42,19 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        // A raw container occupies its declared size, not the rest of the
+        // containing file. Consumers hashing Source::bytes must not include
+        // adjacent records or unrelated trailing bytes.
+        let tail = &data[offset..];
+        let size = u32::from_le_bytes(tail.get(0x18..0x1c)?.try_into().ok()?) as usize;
+        let bytes = tail.get(..size)?;
+        Container::parse(bytes).ok()?;
+        Some(Source::Raw {
             offset,
-            data: &data[offset..],
-        });
+            data: bytes,
+        })
+    });
     out.extend(raw);
     out
 }
@@ -224,4 +231,50 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An empty, synthetic DXBC container; no title bytes.
+    fn empty_container() -> [u8; 32] {
+        let mut bytes = [0; 32];
+        bytes[..4].copy_from_slice(b"DXBC");
+        bytes[0x14] = 1;
+        bytes[0x18..0x1c].copy_from_slice(&32u32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn raw_sources_exclude_adjacent_records_and_trailing_bytes() {
+        let container = empty_container();
+        let mut data = vec![0xAB; 3];
+        data.extend_from_slice(&container);
+        data.extend_from_slice(&[0xCD; 5]);
+        data.extend_from_slice(&container);
+        data.extend_from_slice(&[0xEF; 7]);
+
+        let found = sources(&data);
+        assert_eq!(found.len(), 2);
+        for (source, expected_offset) in found.iter().zip([3, 40]) {
+            let Source::Raw { offset, .. } = source else {
+                panic!("expected raw source");
+            };
+            assert_eq!(*offset, expected_offset);
+            let bytes = source.bytes().unwrap();
+            assert_eq!(bytes.as_ref(), container.as_slice());
+            assert_eq!(blake3::hash(&bytes), blake3::hash(&container));
+        }
+    }
+
+    #[test]
+    fn raw_sources_reject_truncated_and_undersized_containers() {
+        let mut container = empty_container();
+        assert!(sources(&container[..27]).is_empty());
+        container[0x18..0x1c].copy_from_slice(&33u32.to_le_bytes());
+        assert!(sources(&container).is_empty());
+        container[0x18..0x1c].copy_from_slice(&31u32.to_le_bytes());
+        assert!(sources(&container).is_empty());
+    }
 }

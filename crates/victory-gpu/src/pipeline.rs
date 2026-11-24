@@ -131,24 +131,16 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
-    let host = crate::shader_cache::host_shader(container)?;
+    use victory_shader::{Container, emit};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.stage,
-                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-    Ok(Translated { host, used })
+    let native = emit::translation_program(&c).map_err(|e| e.to_string())?;
+    let host = crate::shader_cache::host_shader(container, |_| {
+        emit::translate_program(&c, &native).map_err(|e| e.to_string())
+    })?;
+    Ok(Translated {
+        host,
+        used: native.used,
+    })
 }
 
 #[repr(C)]

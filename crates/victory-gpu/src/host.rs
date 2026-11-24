@@ -31,6 +31,15 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
+/// A signalled event is not sufficient on its own: D3D12 reports device
+/// removal as UINT64_MAX from GetCompletedValue. Do not publish GPU writes
+/// or reuse submission memory unless completion was actually observed.
+fn submission_completed(wait: u32, completed: u64, expected: u64) -> bool {
+    wait == windows::Win32::Foundation::WAIT_OBJECT_0.0
+        && completed != u64::MAX
+        && completed >= expected
+}
+
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
@@ -250,7 +259,78 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallback_counts_reads_and_zeroes_only_failed_pages() {
+        let mut reads = Vec::new();
+        let mut zeroed = Vec::new();
+        let start = 60 << 10;
+        let stats = super::fallback_pieces(
+            start,
+            12 << 10,
+            |at, n| {
+                reads.push((at, n));
+                at != 64 << 10
+            },
+            |at, n| zeroed.push((at, n)),
+        );
+        assert_eq!(
+            reads,
+            vec![
+                (60 << 10, 4 << 10),
+                (64 << 10, 8 << 10),
+                (64 << 10, 4 << 10),
+                (68 << 10, 4 << 10),
+            ]
+        );
+        assert_eq!(zeroed, vec![(64 << 10, 4 << 10)]);
+        assert_eq!(stats, (4, 4096));
+    }
+
+    #[test]
+    fn fallback_keeps_unaligned_edges_and_empty_ranges() {
+        let mut zeroed = Vec::new();
+        let stats = super::fallback_pieces(4095, 2, |_, _| false, |a, n| zeroed.push((a, n)));
+        assert_eq!(zeroed, vec![(4095, 1), (4096, 1)]);
+        assert_eq!(stats, (3, 2));
+        assert_eq!(
+            super::fallback_pieces(4095, 0, |_, _| panic!("read"), |_, _| panic!("zero")),
+            (0, 0)
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn submission_completion_requires_a_valid_wait_and_fence() {
+        use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        assert!(submission_completed(WAIT_OBJECT_0.0, 8, 8));
+        assert!(submission_completed(WAIT_OBJECT_0.0, 9, 8));
+        assert!(!submission_completed(WAIT_OBJECT_0.0, 7, 8));
+        assert!(!submission_completed(WAIT_OBJECT_0.0, u64::MAX, 8));
+        assert!(!submission_completed(WAIT_FAILED.0, 8, 8));
+        assert!(!submission_completed(WAIT_TIMEOUT.0, 8, 8));
+    }
+
+    #[test]
+    fn scratch_retention_tracks_recent_recordings() {
+        // Simulate the same retention policy without creating D3D resources.
+        let mut chunks = vec![(); 12];
+        let mut previous = 0;
+        for (current, used, expected) in [
+            (11, 256, 12), // large recording
+            (1, 256, 12),  // keep the previous high-water mark
+            (0, 256, 2),   // release ten no-longer-needed chunks
+            (0, 0, 1),     // keep one from the preceding recording
+            (0, 0, 0),     // two idle recordings: release all
+        ] {
+            let (keep, consumed) = scratch_retention(current, used, previous);
+            chunks.truncate(keep);
+            previous = consumed;
+            assert_eq!(chunks.len(), expected);
+        }
+        assert_eq!(scratch_retention(3, 0, 0), (3, 3));
+        assert_eq!(scratch_retention(3, 256, 0), (4, 4));
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -360,6 +440,26 @@ struct Scratch {
     chunks: Vec<(ID3D12Resource, usize, u64)>,
     current: usize,
     used: u64,
+    /// Number of pooled chunks consumed by the previous recording.
+    previous_chunks: usize,
+}
+
+impl Scratch {
+    /// Keep the recent two-recording high-water mark, not the lifetime
+    /// maximum. Called only after the allocator/list reset has succeeded.
+    fn reset_recording(&mut self) {
+        let (keep, consumed) = scratch_retention(self.current, self.used, self.previous_chunks);
+        self.chunks.truncate(keep);
+        self.previous_chunks = consumed;
+        (self.current, self.used) = (0, 0);
+    }
+}
+
+/// The current chunk may be unused, e.g. if allocation of the next
+/// chunk failed. Earlier chunks are still accounted for in that case.
+fn scratch_retention(current: usize, used: u64, previous: usize) -> (usize, usize) {
+    let consumed = current + usize::from(used != 0);
+    (consumed.max(previous), consumed)
 }
 
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
@@ -534,11 +634,23 @@ impl Host {
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                let wait = match waited {
+                    Ok(()) => WaitForSingleObject(self.event, INFINITE),
+                    Err(e) => fail(format_args!(
+                        "host submission fence setup failed ({e}){}{}",
+                        self.removal_data(runs),
+                        last_notes(runs)
+                    )),
+                };
+                let completed = self.fence.GetCompletedValue();
+                if !submission_completed(wait.0, completed, *submitted) {
+                    fail(format_args!(
+                        "host submission completion not confirmed (wait {:#x}, completed {completed:#x}, expected {:#x}){}{}",
+                        wait.0,
+                        *submitted,
+                        self.removal_data(runs),
+                        last_notes(runs)
+                    ));
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -885,10 +997,6 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (scratch.current, scratch.used) = (0, 0);
-        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -898,6 +1006,8 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        // The old recording no longer names these upload allocations.
+        self.scratch.lock().unwrap_or_else(|e| e.into_inner()).reset_recording();
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -1229,6 +1339,45 @@ impl HostList {
     }
 }
 
+/// Pending ranges indexed by the identity of their retained Arc. Keep
+/// first-seen order for the actual refreshes; the index only speeds up
+/// range coalescing and is cleared at each flush.
+struct Refreshes<T> {
+    ranges: Vec<(std::sync::Arc<T>, usize, usize)>,
+    index: std::collections::HashMap<usize, usize>,
+}
+
+impl<T> Default for Refreshes<T> {
+    fn default() -> Self {
+        Self {
+            ranges: Vec::new(),
+            index: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<T> Refreshes<T> {
+    fn add(&mut self, copy: &std::sync::Arc<T>, address: usize, len: usize) {
+        let end = address + len;
+        let key = std::sync::Arc::as_ptr(copy) as usize;
+        match self.index.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let (_, from, to) = &mut self.ranges[*entry.get()];
+                (*from, *to) = ((*from).min(address), (*to).max(end));
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(self.ranges.len());
+                self.ranges.push((copy.clone(), address, end));
+            }
+        }
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = (std::sync::Arc<T>, usize, usize)> + '_ {
+        self.index.clear();
+        self.ranges.drain(..)
+    }
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -1239,22 +1388,14 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Refreshes<crate::shadow::Shadow>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
-        match self
-            .refreshes
-            .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
-        }
+        self.refreshes.add(shadow, address, len);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -1271,7 +1412,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        for (shadow, from, to) in self.refreshes.drain() {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
@@ -1320,22 +1461,53 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+    #[cfg(feature = "diagnostics")]
+    let fallback_started = std::time::Instant::now();
+    let (reads, unmapped) = fallback_pieces(
+        src as usize,
+        len,
+        |at, n| read(at as *const u8, dst.wrapping_add(at - src as usize), n),
+        |at, n| {
+            let to = dst.wrapping_add(at - src as usize);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to.write_bytes(0, n) };
+        },
+    );
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::FallbackReads, reads);
+        add(C::Unmapped, unmapped);
+        add(C::FallbackUs, fallback_started.elapsed().as_micros() as u64);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (reads, unmapped);
+}
+
+/// Retry a failed bulk read in 64 KiB pieces, then 4 KiB pages. Returns
+/// the number of retry reads (excluding the initial bulk read) and the
+/// number of bytes zeroed. The callbacks keep this policy testable without
+/// title memory or a graphics device.
+fn fallback_pieces(
+    start: usize,
+    len: usize,
+    mut read_piece: impl FnMut(usize, usize) -> bool,
+    mut zero: impl FnMut(usize, usize),
+) -> (u64, u64) {
+    let (mut reads, mut unmapped) = (0, 0);
+    for_pieces(start, len, 64 << 10, |at, n| {
+        reads += 1;
+        if !read_piece(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                reads += 1;
+                if !read_piece(at, n) {
+                    zero(at, n);
+                    unmapped += n as u64;
                 }
             });
         }
     });
+    (reads, unmapped)
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -1525,9 +1697,15 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+        // Diagnostics must report each drained sample: otherwise four of
+        // five one-second windows (including per-shader drops) disappear.
+        // Keep the ordinary release log cadence unchanged.
+        if cfg!(feature = "diagnostics")
+            || self.logged.elapsed() >= std::time::Duration::from_secs(5)
+        {
             self.logged = std::time::Instant::now();
             tracing::info!(
+                sample_frames = frames as u32,
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
@@ -1984,6 +2162,38 @@ fn pump() {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    #[test]
+    fn indexed_refreshes_match_ordered_linear_coalescing() {
+        let copies: Vec<_> = (0..64).map(|_| Arc::new(7u32)).collect();
+        let mut pending = super::Refreshes::default();
+        let mut reference: Vec<(Arc<u32>, usize, usize)> = Vec::new();
+        for i in 0..2048 {
+            let copy = &copies[(i * 17) % copies.len()];
+            let start = (i * 31) % 4096;
+            let len = i % 129;
+            pending.add(copy, start, len);
+            if let Some((_, from, to)) =
+                reference.iter_mut().find(|(s, ..)| Arc::ptr_eq(s, copy))
+            {
+                *from = (*from).min(start);
+                *to = (*to).max(start + len);
+            } else {
+                reference.push((copy.clone(), start, start + len));
+            }
+        }
+        let got: Vec<_> = pending.drain().collect();
+        assert_eq!(got.len(), reference.len());
+        for ((a, from, to), (b, want_from, want_to)) in got.iter().zip(&reference) {
+            assert!(Arc::ptr_eq(a, b));
+            assert_eq!((*from, *to), (*want_from, *want_to));
+        }
+        assert!(pending.drain().next().is_none());
+        pending.add(&copies[0], 10, 4);
+        let next: Vec<_> = pending.drain().collect();
+        assert_eq!(next.len(), 1);
+        assert_eq!((next[0].1, next[0].2), (10, 14));
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {

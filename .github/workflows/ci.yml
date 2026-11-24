@@ -31,3 +31,8 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      - name: Tests, diagnostics build
+        run: cargo test --workspace --all-features --locked
+      - name: PresentMon benchmark statistics tests
+        shell: pwsh
+        run: ./tools/benchmark/test-present-metrics.ps1

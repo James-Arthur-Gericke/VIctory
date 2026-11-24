@@ -304,6 +304,12 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             }
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
+            let sub = b.second as u32;
+            let texture = crate::resource::host_resource(b.first)?;
+            if sub != u32::MAX && !valid_texture_subresource(texture, sub) {
+                tracing::warn!(sub, "texture transition names an invalid subresource");
+                return None;
+            }
             let wanted = crate::host::texture_state(b.last as u32);
             let (texture, before) = list.transition(b.first, wanted)?;
             Some(Barrier {
@@ -349,6 +355,27 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+/// Preserve the caller's order when a buffer barrier must be replaced by
+/// a global UAV barrier. Moving all buffer ordering to the end can reorder
+/// it relative to a following texture transition or aliasing barrier.
+#[cfg(windows)]
+fn ordered_barriers(
+    barriers: &[Barrier],
+    mut translate: impl FnMut(&Barrier) -> Option<Barrier>,
+    mut buffer_order: impl FnMut(&Barrier) -> bool,
+) -> Vec<Barrier> {
+    let mut host = Vec::with_capacity(barriers.len());
+    for b in barriers {
+        if let Some(mapped) = translate(b) {
+            host.push(mapped);
+        }
+        if buffer_order(b) {
+            host.push(UAV_BARRIER);
+        }
+    }
+    host
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -357,17 +384,13 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
-        // Buffers have host copies, not resources the barrier can name:
-        // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
-            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
-            host.push(UAV_BARRIER);
-        }
+        let host = ordered_barriers(
+            barriers,
+            |b| host_barrier(list, b),
+            |b| {
+                b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
+            },
+        );
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -481,6 +504,50 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
+/// D3D12 subresource indices enumerate mips, array slices, then planes.
+/// For 3D textures depth slices are part of a mip, not array subresources.
+#[cfg(windows)]
+fn subresource_index_valid(index: u32, mips: u16, arrays: u16, planes: u8) -> bool {
+    u64::from(index) < u64::from(mips) * u64::from(arrays) * u64::from(planes)
+}
+
+#[cfg(windows)]
+fn valid_texture_subresource(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    index: u32,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    // SAFETY: a live host texture.
+    let desc = unsafe { texture.GetDesc() };
+    let arrays = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        desc.DepthOrArraySize
+    };
+    // The common plane-zero path needs no feature query. For another
+    // plane use the actual host format, not the guest's console format.
+    if subresource_index_valid(index, desc.MipLevels, arrays, 1) {
+        return true;
+    }
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+        Format: desc.Format,
+        ..Default::default()
+    };
+    // SAFETY: the feature query writes the indicated local structure.
+    let known = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_INFO,
+            (&raw mut info).cast(),
+            size_of_val(&info) as u32,
+        )
+    };
+    known.is_ok()
+        && subresource_index_valid(index, desc.MipLevels, arrays, info.PlaneCount)
+}
+
 /// Texture to texture on the GPU; buffer to texture through an upload
 /// buffer filled at submission. Texture to buffer (read back) is not done
 /// yet.
@@ -511,6 +578,16 @@ extern "system" fn copy_texture_region(
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
+        // The subresource index occupies the low dword of the copy
+        // location's union (represented here by PlacedFootprint).
+        if dst.kind != 0 || !valid_texture_subresource(to, dst.footprint.offset as u32) {
+            tracing::warn!(kind = dst.kind, "invalid texture copy destination subresource");
+            return;
+        }
+        if src.kind != 0 && src.kind != FOOTPRINT {
+            tracing::warn!(kind = src.kind, "unknown texture copy source location");
+            return;
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -540,6 +617,10 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if !valid_texture_subresource(texture, src.footprint.offset as u32) {
+                tracing::warn!("invalid texture copy source subresource");
+                return;
+            }
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
@@ -629,6 +710,10 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        if !valid_texture_subresource(to, dst_sub) || !valid_texture_subresource(from, src_sub) {
+            tracing::warn!(dst_sub, src_sub, "resolve names an invalid subresource");
+            return;
+        }
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
@@ -1140,6 +1225,18 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// Validate against the resource named by ExecuteIndirect, not just its
+/// potentially larger shared backing allocation. Check the complete
+/// address interval before forwarding it to the host shadow lookup.
+fn indirect_address(base: u64, size: u64, offset: u64, len: u64) -> Option<u64> {
+    if offset.checked_add(len)? > size {
+        return None;
+    }
+    let address = base.checked_add(offset)?;
+    address.checked_add(len)?;
+    Some(address)
+}
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -1162,8 +1259,13 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    // Match State::execute_indirect's current span calculation. A
+    // neighbouring placed buffer may share the same host shadow.
+    let len = u64::from(stride) * u64::from(max.max(1));
+    let address = crate::resource::buffer_bytes(arguments)
+        .and_then(|(p, size)| indirect_address(p as u64, size, offset, len));
+    let counter = crate::resource::buffer_bytes(count)
+        .and_then(|(p, size)| indirect_address(p as u64, size, count_offset, 4));
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1404,6 +1506,57 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn buffer_ordering_stays_between_texture_barriers() {
+        // Synthetic barrier identifiers in last; callbacks do not access
+        // any resource or need a device.
+        let named = |kind, last| Barrier { kind, last, ..UAV_BARRIER };
+        let input = [
+            named(0, 10),
+            named(2, 20),
+            named(1, 30),
+            named(0, 40),
+            named(2, 50),
+        ];
+        let output = ordered_barriers(
+            &input,
+            |b| (!matches!(b.last, 20 | 50)).then_some(*b),
+            |b| matches!(b.last, 20 | 50),
+        );
+        let order: Vec<_> = output.iter().map(|b| (b.kind, b.last)).collect();
+        assert_eq!(order, vec![(0, 10), (2, 0), (1, 30), (0, 40), (2, 0)]);
+        assert!(ordered_barriers(&[], |_| None, |_| false).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_subresource_indices_respect_mips_arrays_and_planes() {
+        assert!(subresource_index_valid(11, 3, 2, 2));
+        assert!(!subresource_index_valid(12, 3, 2, 2));
+        assert!(subresource_index_valid(5, 3, 2, 1));
+        assert!(!subresource_index_valid(6, 3, 2, 1));
+        // 3D uses one array slice, regardless of its depth.
+        assert!(subresource_index_valid(3, 4, 1, 1));
+        assert!(!subresource_index_valid(4, 4, 1, 1));
+        assert!(!subresource_index_valid(0, 0, 1, 1));
+        assert!(!subresource_index_valid(0, 1, 0, 1));
+        assert!(!subresource_index_valid(0, 1, 1, 0));
+        assert!(subresource_index_valid(u32::MAX, u16::MAX, u16::MAX, 2));
+    }
+
+    #[test]
+    fn indirect_addresses_stay_inside_the_named_buffer() {
+        assert_eq!(indirect_address(0x1000, 64, 48, 16), Some(0x1030));
+        assert_eq!(indirect_address(0x1000, 64, 49, 16), None);
+        assert_eq!(indirect_address(0x1000, 64, 64, 16), None);
+        assert_eq!(indirect_address(0x1000, 64, 60, 4), Some(0x103c));
+        assert_eq!(indirect_address(0x1000, 64, 61, 4), None);
+        assert_eq!(indirect_address(0x1000, u64::MAX, u64::MAX, 4), None);
+        assert_eq!(indirect_address(u64::MAX - 2, 8, 4, 4), None);
+        assert_eq!(indirect_address(u64::MAX - 6, 8, 4, 4), None);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

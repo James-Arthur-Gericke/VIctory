@@ -2595,17 +2595,21 @@ impl<'a> Lower<'a> {
                 };
                 let r = self.s.m.bin(c, Bin::Add, a, b);
                 let carry = if name == "s_add_u32" {
-                    Some(self.s.m.cmp(c, pred::IULT, r, a))
+                    self.s.m.cmp(c, pred::IULT, r, a)
                 } else {
-                    None
+                    self.signed_overflow(c, true, a, b, r)
                 };
-                (r, carry)
+                (r, Some(carry))
             }
             "s_sub_u32" | "s_sub_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let r = self.s.m.bin(c, Bin::Sub, a, b);
-                let carry = (name == "s_sub_u32").then(|| self.s.m.cmp(c, pred::IULT, a, b));
-                (r, carry)
+                let carry = if name == "s_sub_u32" {
+                    self.s.m.cmp(c, pred::IULT, a, b)
+                } else {
+                    self.signed_overflow(c, false, a, b, r)
+                };
+                (r, Some(carry))
             }
             "s_addc_u32" | "s_subb_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -2760,6 +2764,23 @@ impl<'a> Lower<'a> {
             self.vals.insert(scc, val);
         }
         Ok(())
+    }
+
+    /// Signed scalar add/sub set SCC on two's-complement overflow,
+    /// not on an unsigned carry. Keep the wrapped result and derive the
+    /// flag from its sign and the two operand signs.
+    fn signed_overflow(&mut self, c: usize, add: bool, a: V, b: V, r: V) -> V {
+        let ab = self.s.m.bin(c, Bin::Xor, a, b);
+        let ar = self.s.m.bin(c, Bin::Xor, a, r);
+        let ab = if add {
+            let ones = self.s.m.i32(u32::MAX);
+            self.s.m.bin(c, Bin::Xor, ab, ones)
+        } else {
+            ab
+        };
+        let bits = self.s.m.bin(c, Bin::And, ab, ar);
+        let zero = self.s.m.i32(0);
+        self.s.m.cmp(c, pred::SLT, bits, zero)
     }
 
     /// `a + b (+ cin)` or `a - b (- cin)` with the carry (borrow) out, as the

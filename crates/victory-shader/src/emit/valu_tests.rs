@@ -937,3 +937,40 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn signed_scalar_overflow_drives_scc() {
+    let cases = [
+        [0x7fff_ffff, 1, 0, 0],
+        [0x8000_0000, 0xffff_ffff, 0, 0],
+        [0xffff_ffff, 1, 0, 0],
+        [0x8000_0000, 1, 0, 0],
+        [0x7fff_ffff, 0xffff_ffff, 0, 0],
+        [0, 0, 0, 0],
+    ];
+    for (op, add) in [(0x02, true), (0x03, false)] {
+        let shader = build_valu_cs(&[
+            sop2(op, 6, 0, 1),
+            sop2(0x0a, 7, 129, 128), // s_cselect_b32 s7, 1, 0
+            vop1(1, 0, sgpr(7)),
+        ]);
+        run_cases(&shader, &cases, |backend, _, inputs, got| {
+            let (a, b) = (inputs[0] as i32, inputs[1] as i32);
+            let overflow = if add { a.overflowing_add(b).1 } else { a.overflowing_sub(b).1 };
+            assert_eq!(got, u32::from(overflow), "{backend}: add={add}, {a}, {b}");
+        });
+    }
+    // SOPK uses the old destination and a signed 16-bit immediate.
+    for imm in [1i16, -1] {
+        let shader = build_valu_cs(&[
+            s_mov_b32(6, 0),
+            0xb780_0000 | (6 << 16) | u32::from(imm as u16),
+            sop2(0x0a, 7, 129, 128),
+            vop1(1, 0, sgpr(7)),
+        ]);
+        run_cases(&shader, &cases, |backend, _, inputs, got| {
+            let overflow = (inputs[0] as i32).overflowing_add(i32::from(imm)).1;
+            assert_eq!(got, u32::from(overflow), "{backend}: addk {imm}");
+        });
+    }
+}

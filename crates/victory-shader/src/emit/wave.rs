@@ -137,8 +137,7 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             continue;
         };
         let end = (i + 1..insts.len()).find(|&j| {
-            insts[j].write(Reg::S(EXEC)).is_some()
-                && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
+            restores_exec(inst, &insts[j], saved, p.wave64)
         });
         let Some(end) = end else {
             break;
@@ -148,6 +147,36 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         i = end + 1;
     }
     out
+}
+
+/// A section ends only at a copy of the saved mask, not at an ALU
+/// operation that merely reads it. In Wave64 both SSA dwords must match:
+/// the high half may have been overwritten independently.
+fn restores_exec(start: &Inst, end: &Inst, saved: Value, wave64: bool) -> bool {
+    let code = saved_code(start);
+    let mov = if wave64 { "s_mov_b64" } else { "s_mov_b32" };
+    if end.name() != mov
+        || end.write(Reg::S(EXEC)).is_none()
+        || end.read(Reg::S(code)) != Some(saved)
+        || !matches!(
+            &end.fields,
+            Fields::Sop { src, .. }
+                if matches!(src.first(), Some(Operand::Scalar { code: c, .. }) if *c == code)
+        )
+    {
+        return false;
+    }
+    if wave64 {
+        let Some(high) = code.checked_add(1) else {
+            return false;
+        };
+        start.write(Reg::S(high)).is_some_and(|v| {
+            end.write(Reg::S(EXEC + 1)).is_some()
+                && end.read(Reg::S(high)) == Some(v)
+        })
+    } else {
+        true
+    }
 }
 
 fn saved_code(inst: &Inst) -> u8 {
@@ -620,6 +649,26 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_wave_restore_requires_the_saved_mask() {
+        // Synthetic GFX10: save EXEC into s0(:s1), then restore it.
+        for (wave64, save, restore) in [
+            (false, 0xBE80_3DC1u32, 0xBEFE_0300u32),
+            (true, 0xBE80_25C1u32, 0xBEFE_0400u32),
+        ] {
+            let words = [save, restore, 0xBF81_0000];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let mut p = crate::ir::build(&code, wave64, 8).unwrap();
+            assert_eq!(sections(&p, 0)[&0].end, 1);
+            let insts = &mut p.blocks[0].insts;
+            let reg = Reg::S(if wave64 { 1 } else { 0 });
+            let (_, value) = insts[1].reads.iter_mut().find(|(r, _)| *r == reg).unwrap();
+            // Model an independent overwrite of the saved SSA dword.
+            *value = Value(u32::MAX);
+            assert!(sections(&p, 0).is_empty());
+        }
+    }
 
     #[test]
     fn dpp_lanes_follow_the_isa() {

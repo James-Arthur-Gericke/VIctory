@@ -15,10 +15,10 @@
 //! All library calls are serialised: the interface does not promise that
 //! stores, loads and serialising may overlap.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -106,6 +106,39 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Serialize the load/create/store sequence only for the same cache key.
+/// The registry owns a gate while callers are using or waiting on it;
+/// it does not retain pipeline objects or an unbounded set of old keys.
+#[derive(Default)]
+struct CompileGates(Mutex<HashMap<String, Arc<Mutex<()>>>>);
+
+impl CompileGates {
+    fn with<T>(&self, name: &str, work: impl FnOnce() -> T) -> T {
+        let gate = {
+            let mut gates = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(gate) = gates.get(name) {
+                gate.clone()
+            } else {
+                let gate = Arc::new(Mutex::new(()));
+                gates.insert(name.to_owned(), gate.clone());
+                gate
+            }
+        };
+        let result = {
+            let _held = gate.lock().unwrap_or_else(|e| e.into_inner());
+            work()
+        };
+        // Drop this caller's reference while holding the registry lock:
+        // otherwise simultaneous departures can both miss the last user.
+        let mut gates = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        drop(gate);
+        if gates.get(name).is_some_and(|g| Arc::strong_count(g) == 1) {
+            gates.remove(name);
+        }
+        result
+    }
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -118,20 +151,24 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
-    if let Ok(pso) = load(&library.lock().unwrap_or_else(|e| e.into_inner()).library, PCWSTR(wide.as_ptr())) {
-        LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(pso);
-    }
-    // Compiled outside the lock: compiles take up to seconds.
-    let pso = create()?;
-    MADE.fetch_add(1, Ordering::Relaxed);
-    let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        l.added += 1;
-    }
-    Ok(pso)
+    static GATES: OnceLock<CompileGates> = OnceLock::new();
+    GATES.get_or_init(CompileGates::default).with(name, || {
+        if let Ok(pso) = load(&library.lock().unwrap_or_else(|e| e.into_inner()).library, PCWSTR(wide.as_ptr())) {
+            LOADED.fetch_add(1, Ordering::Relaxed);
+            return Ok(pso);
+        }
+        // Compiled outside the library lock: unrelated keys can compile
+        // concurrently. A waiter on this key loads the stored result.
+        let pso = create()?;
+        MADE.fetch_add(1, Ordering::Relaxed);
+        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a live pipeline; a name already stored (a description that
+        // differs) is refused, which leaves the library as it was.
+        if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+            l.added += 1;
+        }
+        Ok(pso)
+    })
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -228,6 +265,33 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_key_waiters_share_a_successful_cache_fill() {
+        let gates = CompileGates::default();
+        let stored = AtomicBool::new(false);
+        let creates = AtomicU64::new(0);
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    start.wait();
+                    gates.with("same", || {
+                        if !stored.load(Ordering::Relaxed) {
+                            creates.fetch_add(1, Ordering::Relaxed);
+                            std::thread::yield_now();
+                            stored.store(true, Ordering::Relaxed);
+                        }
+                    });
+                });
+            }
+        });
+        assert_eq!(creates.load(Ordering::Relaxed), 1);
+        assert!(gates.0.lock().unwrap().is_empty());
+        assert_eq!(gates.with("same", || Err::<(), _>("refused")), Err("refused"));
+        assert_eq!(gates.with("same", || Ok::<_, &str>(7)), Ok(7));
+        assert!(gates.0.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

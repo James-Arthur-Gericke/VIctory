@@ -67,6 +67,41 @@ unsafe impl Sync for Host {}
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Diagnostics of the synchronous scheduling boundary. Queue wait is
+/// cumulative caller time, not GPU execution or elapsed wall time.
+#[cfg(any(test, feature = "diagnostics"))]
+#[derive(Default, Debug, PartialEq, Eq)]
+struct ScheduleSample {
+    calls: u64,
+    empty: u64,
+    lists: u64,
+    groups: u64,
+    wait_us: u64,
+    max_wait_us: u64,
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+impl ScheduleSample {
+    fn record(&mut self, lists: usize, groups: usize, wait_us: u64) {
+        self.calls += 1;
+        self.empty += u64::from(lists == 0);
+        self.lists += lists as u64;
+        self.groups += groups as u64;
+        self.wait_us += wait_us;
+        self.max_wait_us = self.max_wait_us.max(wait_us);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static SCHEDULE: Mutex<ScheduleSample> = Mutex::new(ScheduleSample {
+    calls: 0,
+    empty: 0,
+    lists: 0,
+    groups: 0,
+    wait_us: 0,
+    max_wait_us: 0,
+});
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -493,8 +528,25 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        #[cfg(feature = "diagnostics")]
+        let queued = std::time::Instant::now();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let wait_us = (started - queued).as_micros() as u64;
+        // An empty host submission has no deferred work or completion
+        // writes. Retain the serialization boundary, but avoid submitting
+        // an empty D3D list array and signalling/waiting on a new fence.
+        if runs.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            SCHEDULE.lock().unwrap_or_else(|e| e.into_inner()).record(0, 0, wait_us);
+            // SAFETY: a plain query; preserve device-removal reporting.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                fail(format_args!("host GPU device removed before an empty submission{}", self.removal_data(runs)));
+            }
+            self.log_messages();
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
@@ -524,6 +576,8 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        #[cfg(feature = "diagnostics")]
+        SCHEDULE.lock().unwrap_or_else(|e| e.into_inner()).record(runs.len(), groups.len(), wait_us);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1527,6 +1581,19 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            {
+                let sample = std::mem::take(&mut *SCHEDULE.lock().unwrap_or_else(|e| e.into_inner()));
+                tracing::info!(
+                    calls = sample.calls,
+                    empty = sample.empty,
+                    title_lists = sample.lists,
+                    gpu_groups = sample.groups,
+                    total_lock_wait_us = sample.wait_us,
+                    max_lock_wait_us = sample.max_wait_us,
+                    "submission scheduling sample (caller wait, not GPU time)"
+                );
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -1984,6 +2051,22 @@ fn pump() {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    #[test]
+    fn scheduling_sample_counts_empty_and_grouped_submissions() {
+        let mut sample = super::ScheduleSample::default();
+        sample.record(0, 0, 12);
+        sample.record(4, 1, 20);
+        sample.record(3, 3, 5);
+        let observed = std::mem::take(&mut sample);
+        assert_eq!(observed.calls, 3);
+        assert_eq!(observed.empty, 1);
+        assert_eq!(observed.lists, 7);
+        assert_eq!(observed.groups, 4);
+        assert_eq!(observed.wait_us, 37);
+        assert_eq!(observed.max_wait_us, 20);
+        assert_eq!(sample, super::ScheduleSample::default());
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {

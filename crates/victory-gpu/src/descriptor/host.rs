@@ -469,10 +469,7 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -487,10 +484,18 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
+}
+
+/// Validate the full byte interval before it is used for a shadow copy.
+fn checked_buffer_range(base: u64, first: u64, count: u32, element: u64) -> Option<(u64, u64)> {
+    if element == 0 {
+        return None;
+    }
+    let start = base.checked_add(first.checked_mul(element)?)?;
+    let len = u64::from(count).checked_mul(element)?;
+    start.checked_add(len)?;
+    Some((start, len))
 }
 
 /// The host resource a slot made by [`make`] views, if any.
@@ -515,7 +520,7 @@ fn buffer_srv(
         );
         return None;
     }
-    buffer.FirstElement += offset / element;
+    buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -557,7 +562,7 @@ fn buffer_uav(
         once!(offset, element, "unordered buffer view not on an element of its host copy");
         return None;
     }
-    buffer.FirstElement += offset / element;
+    buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     buffer.CounterOffsetInBytes = 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -922,6 +927,21 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_byte_ranges_do_not_wrap() {
+        assert_eq!(checked_buffer_range(0x1000, 3, 4, 16), Some((0x1030, 64)));
+        assert_eq!(checked_buffer_range(0x1000, 0, 0, 4), Some((0x1000, 0)));
+        assert_eq!(checked_buffer_range(0, 0, 1, 0), None);
+        assert_eq!(checked_buffer_range(0, u64::MAX, 1, 4), None);
+        assert_eq!(checked_buffer_range(u64::MAX - 1, 1, 1, 4), None);
+        assert_eq!(checked_buffer_range(0, 0, 2, u64::MAX), None);
+        assert_eq!(checked_buffer_range(u64::MAX - 3, 0, 1, 4), None);
+        assert_eq!(
+            checked_buffer_range(u64::MAX - 4, 0, 1, 4),
+            Some((u64::MAX - 4, 4))
+        );
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

@@ -282,6 +282,16 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
             _ => return Err(isa(offset, "unknown encoding")),
         }
     };
+    // BVH instructions have fixed ray operand counts, independent of
+    // the image dimension. Reject an NSA encoding that omits operands:
+    // fields() would otherwise read the absent words as zero (VGPR 0).
+    if encoding == Encoding::Mimg && matches!(opcode, 0xe6 | 0xe7) && len > 2 {
+        let a16 = word(1)? >> 30 & 1 != 0;
+        let operands: usize = if a16 { 8 } else { 11 } + usize::from(opcode == 0xe7);
+        if len - 2 < (operands - 1).div_ceil(4) {
+            return Err(isa(offset, "BVH NSA ray operands are truncated"));
+        }
+    }
     Ok(Instruction {
         offset,
         encoding,
@@ -350,6 +360,40 @@ mod tests {
             .iter()
             .map(|i| (i.offset, i.words.len(), i.name().unwrap_or("?")))
             .collect()
+    }
+
+    #[test]
+    fn bvh_nsa_requires_all_ray_operands() {
+        // RDNA2 BVH/BVH64, four results, R128, UNRM. A16 reduces
+        // the direction and inverse-direction fields to packed halves.
+        for (opcode, a16, required) in [
+            (0xe6u32, false, 3usize),
+            (0xe6, true, 2),
+            (0xe7, false, 3),
+            (0xe7, true, 2),
+        ] {
+            let header = (0x3c << 26)
+                | ((opcode & 0x7f) << 18)
+                | (opcode >> 7)
+                | (1 << 15)
+                | (1 << 12)
+                | (0xf << 8);
+            for extra in 0..=3 {
+                let mut words = vec![header | ((extra as u32) << 1), u32::from(a16) << 30];
+                words.extend(std::iter::repeat_n(0x0403_0201, extra));
+                words.push(S_ENDPGM);
+                let result = decode(&bytes(&words));
+                if extra == 0 || extra >= required {
+                    let decoded = result.unwrap();
+                    assert_eq!(decoded[0].words.len(), extra + 2);
+                    assert_eq!(decoded[0].name(), name(Encoding::Mimg, opcode as u16));
+                } else {
+                    assert!(matches!(result, Err(ShaderError::Isa {
+                        reason: "BVH NSA ray operands are truncated", ..
+                    })));
+                }
+            }
+        }
     }
 
     #[test]

@@ -51,6 +51,14 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+/// A fresh table and the exact cache entry that owns its dynamic slots.
+struct DynamicTable {
+    heap: usize,
+    first: u32,
+    count: u32,
+    key: (u64, u64),
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -64,6 +72,9 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// Missing attachments must not compact the title's output slots.
+    requested_targets: usize,
+    depth_requested: bool,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -76,15 +87,15 @@ pub(crate) struct State {
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    dynamic: Vec<DynamicTable>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for table in &self.dynamic {
+            crate::descriptor::release_dynamic(table.heap, table.first, table.count);
         }
     }
 }
@@ -172,6 +183,20 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// A failed bind records no draw/dispatch using its new tables.
+    /// Return only allocations made during that bind, leaving tables
+    /// referenced by earlier recorded commands untouched.
+    fn rollback_tables(
+        &mut self,
+        checkpoint: usize,
+        mut release: impl FnMut(usize, u32, u32),
+    ) {
+        for table in self.dynamic.drain(checkpoint..) {
+            self.fresh_tables.remove(&table.key);
+            release(table.heap, table.first, table.count);
+        }
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
@@ -256,10 +281,13 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        self.requested_targets = handles.len();
+        self.depth_requested = depth != 0;
+        self.targets.clear();
+        self.depth = 0;
         let Some(host) = crate::host::host() else {
             return;
         };
-        self.targets.clear();
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -277,14 +305,28 @@ impl State {
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
-        self.depth = 0;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        let mut dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
+        // Do not bind a compacted subset: SV_TargetN would address a
+        // different texture, and the pipeline's attachment formats may not
+        // match. Until null/missing views can be represented, refuse draws
+        // against this incomplete binding. A later complete bind recovers.
+        if !self.attachments_complete() {
+            once!(
+                requested = self.requested_targets,
+                found = self.targets.len(),
+                depth_requested = self.depth_requested,
+                depth_found = self.depth != 0,
+                "incomplete render-target binding; graphics draws will be dropped"
+            );
+            rtvs.clear();
+            dsv = None;
+        }
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -294,6 +336,12 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+    }
+
+    /// Whether every requested output slot has a host resource. No
+    /// attachments is valid for a graphics pipeline that needs none.
+    fn attachments_complete(&self) -> bool {
+        self.targets.len() == self.requested_targets && (!self.depth_requested || self.depth != 0)
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -341,6 +389,9 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        if !self.attachments_complete() {
+            return false;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -456,11 +507,13 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let checkpoint = self.dynamic.len();
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
             let made = self.tables(list, &t.used, compute);
             if self.table_failed {
+                self.rollback_tables(checkpoint, crate::descriptor::release_dynamic);
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
@@ -733,8 +786,12 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            self.dynamic.push(DynamicTable {
+                heap: std::ptr::from_ref(heap) as usize,
+                first,
+                count: n,
+                key,
+            });
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1214,4 +1271,61 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::State;
+
+    #[test]
+    fn graphics_attachments_require_every_requested_slot() {
+        let mut s = State::default();
+        assert!(s.attachments_complete());
+
+        s.requested_targets = 3;
+        s.targets.extend([1, 3]);
+        assert!(!s.attachments_complete());
+        s.targets.insert(1, 2);
+        assert!(s.attachments_complete());
+
+        s.depth_requested = true;
+        assert!(!s.attachments_complete());
+        s.depth = 4;
+        assert!(s.attachments_complete());
+
+        s.reset(std::ptr::null());
+        assert!(s.attachments_complete());
+        s.depth_requested = true;
+        assert!(!s.attachments_complete());
+        s.depth = 5;
+        assert!(s.attachments_complete()); // depth-only pass
+    }
+}
+
+#[cfg(test)]
+mod descriptor_rollback_tests {
+    use super::*;
+
+    #[test]
+    fn failed_bind_releases_only_new_descriptor_tables() {
+        let mut state = State::default();
+        for (heap, first, count, key) in [
+            (1, 100, 3, (10, 20)),
+            (1, 103, 4, (11, 21)),
+            (2, 100, 5, (12, 22)),
+        ] {
+            state.fresh_tables.insert(key, first);
+            state.dynamic.push(DynamicTable { heap, first, count, key });
+        }
+        let mut released = Vec::new();
+        state.rollback_tables(1, |heap, first, count| released.push((heap, first, count)));
+        assert_eq!(released, vec![(1, 103, 4), (2, 100, 5)]);
+        assert_eq!(state.dynamic.len(), 1);
+        assert_eq!(state.fresh_tables.len(), 1);
+        assert_eq!(state.fresh_tables.get(&(10, 20)), Some(&100));
+        state.rollback_tables(1, |_, _, _| panic!("nothing new"));
+        // Do not ask Drop to release synthetic allocations.
+        state.rollback_tables(0, |_, _, _| {});
+        assert!(state.fresh_tables.is_empty());
+    }
 }

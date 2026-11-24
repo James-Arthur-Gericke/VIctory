@@ -253,6 +253,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn texture_upload_reuse_retains_only_a_used_chunk() {
+        use std::sync::Arc;
+        let owner = Arc::new(7u32);
+        let weak = Arc::downgrade(&owner);
+        let chunk = reset_texture_upload(Some((owner, 42, 513))).unwrap();
+        assert_eq!(chunk.1, 42);
+        assert_eq!(chunk.2, 0);
+        assert_eq!(texture_upload_range(chunk.2, 512), Some((0, 512)));
+        assert!(weak.upgrade().is_some());
+        // An idle recording releases the retained allocation.
+        assert!(reset_texture_upload(Some(chunk)).is_none());
+        assert!(weak.upgrade().is_none());
+        assert!(reset_texture_upload::<u32>(None).is_none());
+    }
+
+    #[test]
     fn texture_upload_regions_are_aligned_disjoint_and_bounded() {
         let mut used = 0;
         for size in [1, 511, 512, 513, SMALL_TEXTURE_UPLOAD] {
@@ -405,6 +421,14 @@ fn texture_upload_range(used: u64, size: u64) -> Option<(u64, u64)> {
     (end <= TEXTURE_UPLOAD_CHUNK).then_some((offset, end))
 }
 
+// Keep at most one chunk from an active recording. A recording that
+// did not use it leaves its cursor at zero and releases it at reset.
+fn reset_texture_upload<T>(chunk: Option<(T, usize, u64)>) -> Option<(T, usize, u64)> {
+    chunk
+        .filter(|(_, _, used)| *used != 0)
+        .map(|(buffer, data, _)| (buffer, data, 0))
+}
+
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
@@ -436,7 +460,8 @@ struct Deferred {
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
     /// Current small texture-copy upload chunk: resource, mapping, cursor.
-    /// Older chunks remain in uploads until the list is reset.
+    /// Older chunks remain in uploads until reset. One active chunk may
+    /// be reused by the next recording after a completed reset.
     texture_upload: Option<(ID3D12Resource, usize, u64)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -921,7 +946,6 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -939,6 +963,12 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        let mut deferred = self.deferred();
+        let texture_upload = reset_texture_upload(deferred.texture_upload.take());
+        *deferred = Deferred {
+            texture_upload,
+            ..Deferred::default()
+        };
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -1137,8 +1167,12 @@ impl HostList {
         if fits.is_none() {
             let (buffer, data) = host.upload_buffer(TEXTURE_UPLOAD_CHUNK)?;
             name(&buffer, || "list texture upload chunk".into());
-            deferred.uploads.push(buffer.clone());
-            deferred.texture_upload = Some((buffer, data as usize, 0));
+            if let Some((previous, _, _)) =
+                deferred.texture_upload.replace((buffer, data as usize, 0))
+            {
+                // Earlier recorded copies still name the old chunk.
+                deferred.uploads.push(previous);
+            }
         }
         let (buffer, data, used) = deferred.texture_upload.as_mut()?;
         let (offset, end) = texture_upload_range(*used, size)?;

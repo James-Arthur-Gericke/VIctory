@@ -253,6 +253,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scratch_retention_tracks_recent_recordings() {
+        // Simulate the same retention policy without creating D3D resources.
+        let mut chunks = vec![(); 12];
+        let mut previous = 0;
+        for (current, used, expected) in [
+            (11, 256, 12), // large recording
+            (1, 256, 12),  // keep the previous high-water mark
+            (0, 256, 2),   // release ten no-longer-needed chunks
+            (0, 0, 1),     // keep one from the preceding recording
+            (0, 0, 0),     // two idle recordings: release all
+        ] {
+            let (keep, consumed) = scratch_retention(current, used, previous);
+            chunks.truncate(keep);
+            previous = consumed;
+            assert_eq!(chunks.len(), expected);
+        }
+        assert_eq!(scratch_retention(3, 0, 0), (3, 3));
+        assert_eq!(scratch_retention(3, 256, 0), (4, 4));
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -360,6 +381,26 @@ struct Scratch {
     chunks: Vec<(ID3D12Resource, usize, u64)>,
     current: usize,
     used: u64,
+    /// Number of pooled chunks consumed by the previous recording.
+    previous_chunks: usize,
+}
+
+impl Scratch {
+    /// Keep the recent two-recording high-water mark, not the lifetime
+    /// maximum. Called only after the allocator/list reset has succeeded.
+    fn reset_recording(&mut self) {
+        let (keep, consumed) = scratch_retention(self.current, self.used, self.previous_chunks);
+        self.chunks.truncate(keep);
+        self.previous_chunks = consumed;
+        (self.current, self.used) = (0, 0);
+    }
+}
+
+/// The current chunk may be unused, e.g. if allocation of the next
+/// chunk failed. Earlier chunks are still accounted for in that case.
+fn scratch_retention(current: usize, used: u64, previous: usize) -> (usize, usize) {
+    let consumed = current + usize::from(used != 0);
+    (consumed.max(previous), consumed)
 }
 
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
@@ -885,10 +926,6 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (scratch.current, scratch.used) = (0, 0);
-        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -898,6 +935,8 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        // The old recording no longer names these upload allocations.
+        self.scratch.lock().unwrap_or_else(|e| e.into_inner()).reset_recording();
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this

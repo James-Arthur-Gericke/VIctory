@@ -42,6 +42,9 @@ jobs:
       - name: Diagnostic log comparator tests
         shell: bash
         run: sh tools/diagnostics/test-compare-logs.sh
+      - name: Storage profiling tests
+        shell: pwsh
+        run: ./tools/benchmark/test-storage-metrics.ps1
 
   hardware-build:
     # Hosted build only: never run a title or access a physical test PC.

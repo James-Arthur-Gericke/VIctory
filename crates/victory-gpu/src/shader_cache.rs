@@ -69,8 +69,10 @@ fn build() -> &'static [u8; 32] {
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+pub(crate) fn host_shader(
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> Result<HostShader, String> {
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),

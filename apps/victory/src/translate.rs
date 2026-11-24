@@ -152,6 +152,35 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+// Keep small-file batches bounded. Large archives keep the original
+// per-shader parallelism and are never grouped into a batch.
+const SMALL_FILE: u64 = 4 << 20;
+const FILE_BATCH: usize = 64;
+
+fn parallel_file_tally<T: Sync>(
+    files: &[T],
+    threads: usize,
+    scan: impl Fn(&T, &mut Tally) + Sync,
+) -> Tally {
+    let next = AtomicUsize::new(0);
+    let total = Mutex::new(Tally::default());
+    std::thread::scope(|scope| {
+        for _ in 0..threads.max(1).min(files.len()) {
+            let scan = &scan;
+            let next = &next;
+            let total = &total;
+            scope.spawn(move || {
+                let mut tally = Tally::default();
+                while let Some(file) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    scan(file, &mut tally);
+                }
+                lock(total).merge(tally);
+            });
+        }
+    });
+    total.into_inner().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -160,6 +189,7 @@ pub fn run(
     jobs: Option<usize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    anyhow::ensure!(jobs != Some(0), "--jobs must be at least 1");
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -183,14 +213,52 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    // CPU-only census: use multiple cores even when each small file has
+    // just one shader. Keep listing/pair selection and optional D3D12
+    // or validator checks on the existing per-file scheduling path.
+    let batch_files = threads > 1 && !validate && !pipelines && !list && pairs.is_empty();
+    let mut small = Vec::new();
+    let flush_small = |files: &mut Vec<PathBuf>| {
+        if files.is_empty() {
+            return;
+        }
+        let tally = parallel_file_tally(files, threads, |path, tally| {
+            let Ok(data) = std::fs::read(path) else {
+                return;
+            };
+            let mut checks = Checks {
+                keep: None,
+                validator: None,
+                host: None,
+            };
+            for source in sources(&data) {
+                translate(&source, path, &seen, tally, &mut checks);
+            }
+        });
+        lock(&total).merge(tally);
+        files.clear();
+    };
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
             .filter_map(Result::ok)
         {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+            if !entry.file_type().is_file() {
                 continue;
             }
+            let size = entry.metadata().ok().map(|m| m.len());
+            if size.is_some_and(|n| n > MAX_FILE) {
+                continue;
+            }
+            if batch_files && size.is_some_and(|n| n <= SMALL_FILE) {
+                small.push(entry.path().to_owned());
+                if small.len() == FILE_BATCH {
+                    flush_small(&mut small);
+                }
+                continue;
+            }
+            // Finish earlier small files before reading a large archive.
+            flush_small(&mut small);
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
@@ -221,6 +289,7 @@ pub fn run(
             });
         }
     }
+    flush_small(&mut small);
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
         "containers   {} ({} duplicates skipped)",
@@ -668,4 +737,29 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_file_tally_visits_every_file_and_merges_counts() {
+        let files: Vec<_> = (0..137).collect();
+        for threads in [1, 2, 8, 256] {
+            let seen = Mutex::new(HashSet::new());
+            let tally = parallel_file_tally(&files, threads, |file, tally| {
+                assert!(lock(&seen).insert(*file));
+                tally.containers += 1;
+                tally.programs += file % 5;
+                tally.fail("synthetic".into(), || file.to_string());
+            });
+            assert_eq!(lock(&seen).len(), files.len());
+            assert_eq!(tally.containers, files.len());
+            assert_eq!(tally.programs, files.iter().map(|n| n % 5).sum());
+            assert_eq!(tally.failed["synthetic"].0, files.len());
+        }
+        let empty = parallel_file_tally::<usize>(&[], 4, |_, _| panic!("no work"));
+        assert_eq!(empty.containers, 0);
+    }
 }

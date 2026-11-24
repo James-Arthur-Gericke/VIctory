@@ -253,6 +253,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn texture_upload_regions_are_aligned_disjoint_and_bounded() {
+        let mut used = 0;
+        for size in [1, 511, 512, 513, SMALL_TEXTURE_UPLOAD] {
+            let (offset, end) = texture_upload_range(used, size).unwrap();
+            assert_eq!(offset % 512, 0);
+            assert!(offset >= used);
+            assert_eq!(end - offset, size);
+            used = end;
+        }
+        assert_eq!(
+            texture_upload_range(TEXTURE_UPLOAD_CHUNK - 512, 512),
+            Some((TEXTURE_UPLOAD_CHUNK - 512, TEXTURE_UPLOAD_CHUNK))
+        );
+        assert_eq!(texture_upload_range(TEXTURE_UPLOAD_CHUNK - 511, 1), None);
+        assert_eq!(texture_upload_range(u64::MAX, 1), None);
+        assert_eq!(texture_upload_range(0, 0), None);
+        assert_eq!(texture_upload_range(0, SMALL_TEXTURE_UPLOAD + 1), None);
+        // A new chunk restarts at zero, independent of the old cursor.
+        assert_eq!(texture_upload_range(0, 1), Some((0, 1)));
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -367,6 +389,22 @@ unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
 
+// Pool only small placed-footprint copies; large copies retain their
+// dedicated allocation. Separate from vertex scratch to preserve alignment.
+const TEXTURE_UPLOAD_CHUNK: u64 = 1 << 20;
+const SMALL_TEXTURE_UPLOAD: u64 = 256 << 10;
+const TEXTURE_UPLOAD_ALIGNMENT: u64 = 512;
+
+fn texture_upload_range(used: u64, size: u64) -> Option<(u64, u64)> {
+    if size == 0 || size > SMALL_TEXTURE_UPLOAD {
+        return None;
+    }
+    let offset = used.checked_add(TEXTURE_UPLOAD_ALIGNMENT - 1)?
+        & !(TEXTURE_UPLOAD_ALIGNMENT - 1);
+    let end = offset.checked_add(size)?;
+    (end <= TEXTURE_UPLOAD_CHUNK).then_some((offset, end))
+}
+
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
@@ -397,6 +435,9 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Current small texture-copy upload chunk: resource, mapping, cursor.
+    /// Older chunks remain in uploads until the list is reset.
+    texture_upload: Option<(ID3D12Resource, usize, u64)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -1074,6 +1115,37 @@ impl HostList {
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
+    }
+
+    /// Allocate a placed-footprint region. A recorded copy retains its
+    /// resource and offset until reset; the submission-time fill touches
+    /// only its own bytes, including when the list is submitted again.
+    pub(crate) fn texture_upload(
+        &self,
+        host: &Host,
+        size: u64,
+    ) -> Option<(ID3D12Resource, *mut u8, u64)> {
+        if size == 0 {
+            return None;
+        }
+        if size > SMALL_TEXTURE_UPLOAD {
+            return self.upload(host, size).map(|(b, p)| (b, p, 0));
+        }
+        let mut deferred = self.deferred();
+        let fits = deferred.texture_upload.as_ref()
+            .and_then(|(_, _, used)| texture_upload_range(*used, size));
+        if fits.is_none() {
+            let (buffer, data) = host.upload_buffer(TEXTURE_UPLOAD_CHUNK)?;
+            name(&buffer, || "list texture upload chunk".into());
+            deferred.uploads.push(buffer.clone());
+            deferred.texture_upload = Some((buffer, data as usize, 0));
+        }
+        let (buffer, data, used) = deferred.texture_upload.as_mut()?;
+        let (offset, end) = texture_upload_range(*used, size)?;
+        *used = end;
+        // SAFETY: the region lies in a retained, persistently mapped chunk.
+        let at = unsafe { (*data as *mut u8).add(offset as usize) };
+        Some((buffer.clone(), at, offset))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is

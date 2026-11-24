@@ -24,6 +24,7 @@ pub(crate) struct GraphicsState {
     sample_mask: u32,
     rasterizer: D3D12_RASTERIZER_DESC,
     depth: D3D12_DEPTH_STENCIL_DESC,
+    depth_explicit: bool,
     /// Input elements, their names pointing into `names`.
     inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
     names: Vec<CString>,
@@ -75,6 +76,7 @@ impl Default for GraphicsState {
                 BackFace: keep,
                 ..Default::default()
             },
+            depth_explicit: false,
             inputs: Vec::new(),
             names: Vec::new(),
             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
@@ -103,12 +105,16 @@ impl GraphicsState {
                 8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
-                11 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
+                11 => {
+                    self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
+                    self.depth_explicit = true;
+                }
                 21 => {
                     // shortcut: the depth bounds test is dropped (the host
                     // pipeline uses the plain description); bring it back
                     // with a stream if a title enables it.
                     let d = data.cast::<D3D12_DEPTH_STENCIL_DESC1>().read_unaligned();
+                    self.depth_explicit = true;
                     self.depth = D3D12_DEPTH_STENCIL_DESC {
                         DepthEnable: d.DepthEnable,
                         DepthWriteMask: d.DepthWriteMask,
@@ -169,6 +175,16 @@ impl GraphicsState {
         }
     }
 
+    /// Match the D3D12 stream default when no depth/stencil state and no
+    /// depth format were supplied. Preserve explicit state, even if invalid.
+    fn effective_depth(&self) -> D3D12_DEPTH_STENCIL_DESC {
+        let mut depth = self.depth;
+        if !self.depth_explicit && self.depth_format == DXGI_FORMAT_UNKNOWN {
+            depth.DepthEnable = false.into();
+        }
+        depth
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -188,7 +204,7 @@ impl GraphicsState {
             self.blend,
             self.sample_mask,
             self.rasterizer,
-            self.depth,
+            self.effective_depth(),
             self.strip_cut.0,
             self.topology.0,
             self.targets,
@@ -494,7 +510,7 @@ impl HostPipeline {
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
-            DepthStencilState: g.depth,
+            DepthStencilState: g.effective_depth(),
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
                 NumElements: g.inputs.len() as u32,
@@ -537,7 +553,7 @@ impl HostPipeline {
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
-            depth = ?g.depth,
+            depth = ?g.effective_depth(),
             dsv = g.depth_format.0,
             targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
             blend = ?g.blend.RenderTarget[0],
@@ -591,7 +607,7 @@ fn mesh_pipeline(
         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
-        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
+        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.effective_depth()),
         targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
         dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
@@ -663,5 +679,30 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_depth_state_depends_on_dsv_format() {
+        let mut g = GraphicsState::default();
+        assert!(!g.effective_depth().DepthEnable.as_bool());
+        let no_depth_key = g.describe();
+
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        assert!(g.effective_depth().DepthEnable.as_bool());
+        g.depth_format = DXGI_FORMAT_UNKNOWN;
+        assert_eq!(g.describe(), no_depth_key);
+
+        // Explicit depth state is never silently changed.
+        g.depth_explicit = true;
+        assert!(g.effective_depth().DepthEnable.as_bool());
+        assert_ne!(g.describe(), no_depth_key);
+        g.depth.DepthEnable = false.into();
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        assert!(!g.effective_depth().DepthEnable.as_bool());
     }
 }
